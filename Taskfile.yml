@@ -1,0 +1,44 @@
+version: "3"
+
+tasks:
+  default:
+    cmds:
+      - task -l
+
+  build:
+    desc: Build the native CLI executable
+    deps:
+      - fmt
+    cmds:
+      - zig build
+
+  wasm:
+    desc: Build the WASM library
+    cmds:
+      - zig build wasm
+
+  test:
+    desc: Run all tests
+    cmds:
+      - zig build test
+
+  fmt:
+    desc: Format Zig code
+    cmds:
+      - zig fmt .
+
+  run:
+    desc: Build and run the CLI
+    cmds:
+      - zig build run -- {{.CLI_ARGS}}
+
+  check:
+    desc: Check format without modifying files and run tests
+    cmds:
+      - zig fmt --check .
+      - zig build test
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -rf .zig-cache zig-out
