@@ -10,8 +10,10 @@ const appVersion = readFileSync(join(__dirname, '..', 'VERSION'), 'utf-8').trim(
 // Serve test fixture files from /fixtures/* during dev and preview
 function fixturesPlugin() {
   const fixturesDir = join(__dirname, '..', 'test', 'fixtures')
+  const testDir = join(__dirname, '..', 'test')
 
   function fixtureMiddleware(req: InReq, res: InRes, next: () => void) {
+    // Serve test fixtures
     if (req.url?.startsWith('/fixtures/')) {
       const filename = req.url.slice('/fixtures/'.length)
       // Only allow .json files, no path traversal
@@ -19,6 +21,16 @@ function fixturesPlugin() {
       readFile(join(fixturesDir, filename), 'utf-8')
         .then((content) => {
           res.setHeader('Content-Type', 'application/json')
+          res.end(content)
+        })
+        .catch(() => next())
+      return
+    }
+    // Serve WASM test harness
+    if (req.url === '/wasm-harness' || req.url === '/wasm-harness.html') {
+      readFile(join(testDir, 'wasm-harness.html'), 'utf-8')
+        .then((content) => {
+          res.setHeader('Content-Type', 'text/html')
           res.end(content)
         })
         .catch(() => next())

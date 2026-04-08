@@ -132,3 +132,13 @@ tasks:
     dir: web
     cmds:
       - bunx --bun vite preview
+
+  web:harness:
+    desc: Build WASM and open the standalone test harness
+    deps:
+      - wasm
+      - web:install
+    dir: web
+    cmds:
+      - echo "Open http://localhost:3000/wasm-harness in your browser"
+      - bunx --bun vite

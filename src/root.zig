@@ -1138,6 +1138,307 @@ export fn lottie_result_len(ptr: [*]const u8) u32 {
     return i;
 }
 
+/// Compile a single frame of a Lottie animation.
+/// Takes the Lottie JSON buffer and a frame number.
+/// Returns a pointer to a JSON result string with all resolved values, or null on error.
+/// The caller must free the result with lottie_free.
+export fn lottie_compile_frame(ptr: [*]const u8, len: u32, frame_num: f64) ?[*]u8 {
+    return lottieCompileFrameInner(ptr, len, frame_num) catch return null;
+}
+
+fn lottieCompileFrameInner(ptr: [*]const u8, len: u32, frame_num: f64) !?[*]u8 {
+    const json_buf = ptr[0..len];
+    const anim = parse(wasm_allocator, json_buf) catch return null;
+    defer anim.deinit();
+
+    const frame = compileFrame(wasm_allocator, &anim, frame_num) catch return null;
+    defer frame.deinit();
+
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(wasm_allocator);
+    const w = result.writer(wasm_allocator);
+
+    try writeStr(w, "{\"frame\":");
+    try writeF64(w, frame.frame);
+    try writeStr(w, ",\"layers\":[");
+
+    for (frame.layers, 0..) |layer, li| {
+        if (li > 0) try writeStr(w, ",");
+        try writeResolvedLayer(w, layer);
+    }
+
+    try writeStr(w, "]}");
+
+    const slice = try result.toOwnedSlice(wasm_allocator);
+    return slice.ptr;
+}
+
+/// Compile all frames of a Lottie animation.
+/// Returns a pointer to a JSON result string with metadata and all frames, or null on error.
+/// The caller must free the result with lottie_free.
+export fn lottie_compile(ptr: [*]const u8, len: u32) ?[*]u8 {
+    return lottieCompileInner(ptr, len) catch return null;
+}
+
+fn lottieCompileInner(ptr: [*]const u8, len: u32) !?[*]u8 {
+    const json_buf = ptr[0..len];
+    const anim = parse(wasm_allocator, json_buf) catch return null;
+    defer anim.deinit();
+
+    const compiled = compile(wasm_allocator, &anim) catch return null;
+    defer compiled.deinit();
+
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(wasm_allocator);
+    const w = result.writer(wasm_allocator);
+
+    try writeStr(w, "{\"frame_rate\":");
+    try writeF64(w, compiled.frame_rate);
+    try writeStr(w, ",\"width\":");
+    try writeU32(w, compiled.width);
+    try writeStr(w, ",\"height\":");
+    try writeU32(w, compiled.height);
+    try writeStr(w, ",\"frame_count\":");
+    try writeUsize(w, compiled.frames.len);
+    try writeStr(w, ",\"frames\":[");
+
+    for (compiled.frames, 0..) |frame, fi| {
+        if (fi > 0) try writeStr(w, ",");
+        try writeStr(w, "{\"frame\":");
+        try writeF64(w, frame.frame);
+        try writeStr(w, ",\"layers\":[");
+
+        for (frame.layers, 0..) |layer, li| {
+            if (li > 0) try writeStr(w, ",");
+            try writeResolvedLayer(w, layer);
+        }
+
+        try writeStr(w, "]}");
+    }
+
+    try writeStr(w, "]}");
+
+    const slice = try result.toOwnedSlice(wasm_allocator);
+    return slice.ptr;
+}
+
+/// Write a ResolvedLayer as JSON.
+fn writeResolvedLayer(w: anytype, layer: ResolvedLayer) !void {
+    try writeStr(w, "{\"ty\":");
+    try writeUsize(w, @intFromEnum(layer.ty));
+    try writeStr(w, ",\"visible\":");
+    try writeStr(w, if (layer.visible) "true" else "false");
+
+    if (layer.name) |name| {
+        try writeStr(w, ",\"name\":\"");
+        try writeJsonEscaped(w, name);
+        try writeStr(w, "\"");
+    }
+
+    if (layer.index) |idx| {
+        try writeStr(w, ",\"index\":");
+        try writeI64(w, idx);
+    }
+
+    if (layer.parent) |p| {
+        try writeStr(w, ",\"parent\":");
+        try writeI64(w, p);
+    }
+
+    try writeStr(w, ",\"in_point\":");
+    try writeF64(w, layer.in_point);
+    try writeStr(w, ",\"out_point\":");
+    try writeF64(w, layer.out_point);
+
+    if (layer.transform) |tr| {
+        try writeStr(w, ",\"transform\":");
+        try writeResolvedTransformJson(w, tr);
+    }
+
+    try writeStr(w, ",\"shapes\":[");
+    for (layer.shapes, 0..) |shape, si| {
+        if (si > 0) try writeStr(w, ",");
+        try writeResolvedShapeJson(w, shape);
+    }
+    try writeStr(w, "]}");
+}
+
+/// Write a ResolvedTransform as JSON.
+fn writeResolvedTransformJson(w: anytype, tr: ResolvedTransform) !void {
+    try writeStr(w, "{\"anchor\":");
+    try writeF64Array3(w, tr.anchor);
+    try writeStr(w, ",\"position\":");
+    try writeF64Array3(w, tr.position);
+    try writeStr(w, ",\"scale\":");
+    try writeF64Array3(w, tr.scale);
+    try writeStr(w, ",\"rotation\":");
+    try writeF64(w, tr.rotation);
+    try writeStr(w, ",\"opacity\":");
+    try writeF64(w, tr.opacity);
+    try writeStr(w, "}");
+}
+
+/// Write a ResolvedShape as JSON.
+fn writeResolvedShapeJson(w: anytype, shape: ResolvedShape) !void {
+    try writeStr(w, "{\"ty\":\"");
+    try writeStr(w, shapeTypeToStr(shape.ty));
+    try writeStr(w, "\"");
+
+    if (shape.name) |name| {
+        try writeStr(w, ",\"name\":\"");
+        try writeJsonEscaped(w, name);
+        try writeStr(w, "\"");
+    }
+
+    if (shape.size) |sz| {
+        try writeStr(w, ",\"size\":");
+        try writeF64Array2(w, sz);
+    }
+
+    if (shape.position) |pos| {
+        try writeStr(w, ",\"position\":");
+        try writeF64Array2(w, pos);
+    }
+
+    if (shape.roundness) |r| {
+        try writeStr(w, ",\"roundness\":");
+        try writeF64(w, r);
+    }
+
+    if (shape.color) |c| {
+        try writeStr(w, ",\"color\":");
+        try writeF64Array4(w, c);
+    }
+
+    if (shape.opacity) |o| {
+        try writeStr(w, ",\"opacity\":");
+        try writeF64(w, o);
+    }
+
+    if (shape.stroke_width) |sw| {
+        try writeStr(w, ",\"stroke_width\":");
+        try writeF64(w, sw);
+    }
+
+    if (shape.transform) |tr| {
+        try writeStr(w, ",\"transform\":");
+        try writeResolvedTransformJson(w, tr);
+    }
+
+    if (shape.items.len > 0) {
+        try writeStr(w, ",\"items\":[");
+        for (shape.items, 0..) |item, i| {
+            if (i > 0) try writeStr(w, ",");
+            try writeResolvedShapeJson(w, item);
+        }
+        try writeStr(w, "]");
+    }
+
+    try writeStr(w, "}");
+}
+
+/// Map ShapeType back to its Lottie string code.
+fn shapeTypeToStr(ty: ShapeType) []const u8 {
+    return switch (ty) {
+        .group => "gr",
+        .rectangle => "rc",
+        .ellipse => "el",
+        .path => "sh",
+        .fill => "fl",
+        .stroke => "st",
+        .transform => "tr",
+        .gradient_fill => "gf",
+        .gradient_stroke => "gs",
+        .merge => "mm",
+        .trim => "tm",
+        .round_corners => "rd",
+        .repeater => "rp",
+        .star => "sr",
+        .unknown => "??",
+    };
+}
+
+/// Write a JSON-escaped string (handles quotes and backslashes).
+fn writeJsonEscaped(w: anytype, s: []const u8) !void {
+    for (s) |c| {
+        if (c == '"') {
+            try w.writeAll("\\\"");
+        } else if (c == '\\') {
+            try w.writeAll("\\\\");
+        } else {
+            try w.writeByte(c);
+        }
+    }
+}
+
+/// Write an i64 as decimal.
+fn writeI64(w: anytype, v: i64) !void {
+    if (v < 0) {
+        try w.writeByte('-');
+        // Handle MIN_INT edge case
+        if (v == std.math.minInt(i64)) {
+            try w.writeAll("9223372036854775808");
+            return;
+        }
+        var buf: [20]u8 = undefined;
+        var i: usize = buf.len;
+        var n: u64 = @intCast(-v);
+        while (n > 0) {
+            i -= 1;
+            buf[i] = @intCast('0' + (n % 10));
+            n /= 10;
+        }
+        try w.writeAll(buf[i..]);
+    } else {
+        var buf: [20]u8 = undefined;
+        var i: usize = buf.len;
+        var n: u64 = @intCast(v);
+        if (n == 0) {
+            try w.writeByte('0');
+            return;
+        }
+        while (n > 0) {
+            i -= 1;
+            buf[i] = @intCast('0' + (n % 10));
+            n /= 10;
+        }
+        try w.writeAll(buf[i..]);
+    }
+}
+
+/// Write a [2]f64 as a JSON array.
+fn writeF64Array2(w: anytype, arr: [2]f64) !void {
+    try w.writeByte('[');
+    try writeF64(w, arr[0]);
+    try w.writeByte(',');
+    try writeF64(w, arr[1]);
+    try w.writeByte(']');
+}
+
+/// Write a [3]f64 as a JSON array.
+fn writeF64Array3(w: anytype, arr: [3]f64) !void {
+    try w.writeByte('[');
+    try writeF64(w, arr[0]);
+    try w.writeByte(',');
+    try writeF64(w, arr[1]);
+    try w.writeByte(',');
+    try writeF64(w, arr[2]);
+    try w.writeByte(']');
+}
+
+/// Write a [4]f64 as a JSON array.
+fn writeF64Array4(w: anytype, arr: [4]f64) !void {
+    try w.writeByte('[');
+    try writeF64(w, arr[0]);
+    try w.writeByte(',');
+    try writeF64(w, arr[1]);
+    try w.writeByte(',');
+    try writeF64(w, arr[2]);
+    try w.writeByte(',');
+    try writeF64(w, arr[3]);
+    try w.writeByte(']');
+}
+
 // ---------------------------------------------------------------
 // Compiler — keyframe interpolation
 // ---------------------------------------------------------------

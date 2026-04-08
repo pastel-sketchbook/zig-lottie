@@ -4,6 +4,8 @@ export interface LottieWasm {
   version: () => string
   parse: (json: string) => ParseResult
   validate: (json: string) => ValidateResult
+  compileFrame: (json: string, frame: number) => CompileFrameResult
+  compile: (json: string) => CompileResult
 }
 
 export interface ParseResult {
@@ -41,6 +43,54 @@ export interface ValidationIssue {
   message: string
 }
 
+export interface ResolvedTransform {
+  anchor: [number, number, number]
+  position: [number, number, number]
+  scale: [number, number, number]
+  rotation: number
+  opacity: number
+}
+
+export interface ResolvedShape {
+  ty: string
+  name?: string
+  size?: [number, number]
+  position?: [number, number]
+  roundness?: number
+  color?: [number, number, number, number]
+  opacity?: number
+  stroke_width?: number
+  transform?: ResolvedTransform
+  items?: ResolvedShape[]
+}
+
+export interface ResolvedLayer {
+  ty: number
+  visible: boolean
+  name?: string
+  index?: number
+  parent?: number
+  in_point: number
+  out_point: number
+  transform?: ResolvedTransform
+  shapes: ResolvedShape[]
+}
+
+export interface CompileFrameResult {
+  frame?: number
+  layers?: ResolvedLayer[]
+  error?: string
+}
+
+export interface CompileResult {
+  frame_rate?: number
+  width?: number
+  height?: number
+  frame_count?: number
+  frames?: { frame: number; layers: ResolvedLayer[] }[]
+  error?: string
+}
+
 interface WasmExports {
   memory: WebAssembly.Memory
   lottie_version: () => number
@@ -49,6 +99,8 @@ interface WasmExports {
   lottie_free: (ptr: number, len: number) => void
   lottie_parse: (ptr: number, len: number) => number
   lottie_validate: (ptr: number, len: number) => number
+  lottie_compile_frame: (ptr: number, len: number, frame: number) => number
+  lottie_compile: (ptr: number, len: number) => number
 }
 
 function assertWasmExports(exports: WebAssembly.Exports): WasmExports {
@@ -60,6 +112,8 @@ function assertWasmExports(exports: WebAssembly.Exports): WasmExports {
     'lottie_free',
     'lottie_parse',
     'lottie_validate',
+    'lottie_compile_frame',
+    'lottie_compile',
   ]
   for (const name of required) {
     if (!(name in exports)) throw new Error(`Missing WASM export: ${name}`)
@@ -73,6 +127,14 @@ function isParseResult(v: unknown): v is ParseResult {
 
 function isValidateResult(v: unknown): v is ValidateResult {
   return typeof v === 'object' && v !== null && 'valid' in v && 'issues' in v
+}
+
+function isCompileFrameResult(v: unknown): v is CompileFrameResult {
+  return typeof v === 'object' && v !== null && 'frame' in v && 'layers' in v
+}
+
+function isCompileResult(v: unknown): v is CompileResult {
+  return typeof v === 'object' && v !== null && 'frame_count' in v && 'frames' in v
 }
 
 export async function loadLottieWasm(): Promise<LottieWasm> {
@@ -129,7 +191,35 @@ export async function loadLottieWasm(): Promise<LottieWasm> {
     }
   }
 
-  return { version, parse, validate }
+  function compileFrame(json: string, frame: number): CompileFrameResult {
+    const resultStr = callWasmJsonWithFrame(exports, exports.lottie_compile_frame, json, frame)
+    if (resultStr === null) {
+      return { error: 'Compile frame failed' }
+    }
+    try {
+      const parsed: unknown = JSON.parse(resultStr)
+      if (isCompileFrameResult(parsed)) return parsed
+      return { error: `Unexpected response shape: ${resultStr.slice(0, 200)}` }
+    } catch {
+      return { error: `Invalid JSON response: ${resultStr.slice(0, 200)}` }
+    }
+  }
+
+  function compile(json: string): CompileResult {
+    const resultStr = callWasmJson(exports, exports.lottie_compile, json)
+    if (resultStr === null) {
+      return { error: 'Compile failed' }
+    }
+    try {
+      const parsed: unknown = JSON.parse(resultStr)
+      if (isCompileResult(parsed)) return parsed
+      return { error: `Unexpected response shape: ${resultStr.slice(0, 200)}` }
+    } catch {
+      return { error: `Invalid JSON response: ${resultStr.slice(0, 200)}` }
+    }
+  }
+
+  return { version, parse, validate, compileFrame, compile }
 }
 
 function callWasmJson(exports: WasmExports, fn: (ptr: number, len: number) => number, json: string): string | null {
@@ -146,8 +236,32 @@ function callWasmJson(exports: WasmExports, fn: (ptr: number, len: number) => nu
   exports.lottie_free(ptr, encoded.length)
 
   if (resultPtr === 0) return null
+  return readWasmJsonResult(exports, resultPtr)
+}
 
-  // Read result string by scanning for matching closing brace
+function callWasmJsonWithFrame(
+  exports: WasmExports,
+  fn: (ptr: number, len: number, frame: number) => number,
+  json: string,
+  frame: number,
+): string | null {
+  const encoder = new TextEncoder()
+  const encoded = encoder.encode(json)
+
+  const ptr = exports.lottie_alloc(encoded.length)
+  if (ptr === 0) return null
+
+  const wasmBuf = new Uint8Array(exports.memory.buffer, ptr, encoded.length)
+  wasmBuf.set(encoded)
+
+  const resultPtr = fn(ptr, encoded.length, frame)
+  exports.lottie_free(ptr, encoded.length)
+
+  if (resultPtr === 0) return null
+  return readWasmJsonResult(exports, resultPtr)
+}
+
+function readWasmJsonResult(exports: WasmExports, resultPtr: number): string {
   const mem = new Uint8Array(exports.memory.buffer)
   let end = resultPtr
   let braceDepth = 0

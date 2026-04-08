@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zig-lottie WASM Test Harness</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: monospace; background: #1e1e2e; color: #cdd6f4; padding: 1rem; }
+  h1 { font-size: 1.2rem; margin-bottom: 0.5rem; }
+  h2 { font-size: 1rem; color: #89b4fa; margin-top: 1rem; margin-bottom: 0.25rem; }
+  .pass { color: #a6e3a1; }
+  .fail { color: #f38ba8; }
+  .info { color: #94e2d5; }
+  pre { background: #181825; padding: 0.5rem; border-radius: 4px; overflow-x: auto; margin: 0.25rem 0; font-size: 0.85rem; }
+  #log { white-space: pre-wrap; line-height: 1.5; }
+  textarea { width: 100%; height: 120px; background: #181825; color: #cdd6f4; border: 1px solid #45475a; padding: 0.5rem; font-family: monospace; font-size: 0.85rem; border-radius: 4px; margin-top: 0.5rem; }
+  button { background: #89b4fa; color: #1e1e2e; border: none; padding: 0.4rem 0.8rem; border-radius: 4px; cursor: pointer; font-family: monospace; margin-top: 0.5rem; }
+  button:hover { background: #74c7ec; }
+</style>
+</head>
+<body>
+<h1>zig-lottie WASM Test Harness</h1>
+<div id="log"></div>
+
+<h2>Interactive</h2>
+<textarea id="input">{
+  "v": "5.7.1", "fr": 30, "ip": 0, "op": 60,
+  "w": 512, "h": 512,
+  "nm": "Test",
+  "layers": [
+    {"ty": 4, "nm": "Shape", "ind": 1, "ip": 0, "op": 60,
+     "ks": {"o": {"a": 1, "k": [{"t": 0, "s": [100]}, {"t": 60, "s": [0]}]}},
+     "shapes": [{"ty": "rc", "nm": "Rect", "s": {"a": 0, "k": [200, 100]}, "p": {"a": 0, "k": [50, 50]}}]}
+  ]
+}</textarea>
+<br>
+<button onclick="runInteractive()">Parse + Validate + Compile Frame 30</button>
+<pre id="interactive-output"></pre>
+
+<script>
+const log = document.getElementById('log');
+const output = document.getElementById('interactive-output');
+let wasmExports = null;
+
+function print(msg, cls) {
+  const span = document.createElement('span');
+  span.className = cls || '';
+  span.textContent = msg + '\n';
+  log.appendChild(span);
+}
+
+function assert(condition, label) {
+  if (condition) {
+    print(`  PASS  ${label}`, 'pass');
+    return true;
+  }
+  print(`  FAIL  ${label}`, 'fail');
+  return false;
+}
+
+// ---- WASM helpers (standalone, no build tools) ----
+
+function wasmAlloc(exports, str) {
+  const encoder = new TextEncoder();
+  const encoded = encoder.encode(str);
+  const ptr = exports.lottie_alloc(encoded.length);
+  if (ptr === 0) return null;
+  const buf = new Uint8Array(exports.memory.buffer, ptr, encoded.length);
+  buf.set(encoded);
+  return { ptr, len: encoded.length };
+}
+
+function readResult(exports, resultPtr) {
+  if (resultPtr === 0) return null;
+  const mem = new Uint8Array(exports.memory.buffer);
+  let end = resultPtr, depth = 0, inStr = false, started = false;
+  for (let i = resultPtr; i < mem.length; i++) {
+    const ch = mem[i];
+    if (ch === 0) { end = i; break; }
+    if (ch === 0x22 && (i === resultPtr || mem[i-1] !== 0x5c)) inStr = !inStr;
+    if (!inStr) {
+      if (ch === 0x7b) { started = true; depth++; }
+      if (ch === 0x7d) { depth--; if (started && depth === 0) { end = i + 1; break; } }
+    }
+  }
+  const bytes = new Uint8Array(exports.memory.buffer, resultPtr, end - resultPtr);
+  const str = new TextDecoder().decode(bytes);
+  exports.lottie_free(resultPtr, end - resultPtr);
+  return str;
+}
+
+function callWasm(exports, fn, json) {
+  const alloc = wasmAlloc(exports, json);
+  if (!alloc) return null;
+  const resultPtr = fn(alloc.ptr, alloc.len);
+  exports.lottie_free(alloc.ptr, alloc.len);
+  const str = readResult(exports, resultPtr);
+  return str ? JSON.parse(str) : null;
+}
+
+function callWasmFrame(exports, fn, json, frame) {
+  const alloc = wasmAlloc(exports, json);
+  if (!alloc) return null;
+  const resultPtr = fn(alloc.ptr, alloc.len, frame);
+  exports.lottie_free(alloc.ptr, alloc.len);
+  const str = readResult(exports, resultPtr);
+  return str ? JSON.parse(str) : null;
+}
+
+// ---- Test suite ----
+
+async function runTests() {
+  print('Loading WASM...', 'info');
+
+  let exports;
+  try {
+    const resp = await fetch('/zig-lottie.wasm');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const bytes = await resp.arrayBuffer();
+    const { instance } = await WebAssembly.instantiate(bytes, {});
+    exports = instance.exports;
+    wasmExports = exports;
+    print('WASM loaded successfully', 'info');
+  } catch (e) {
+    print(`Failed to load WASM: ${e.message}`, 'fail');
+    print('Serve this file from the project root, e.g.:', 'info');
+    print('  python3 -m http.server 8080 --directory zig-out/wasm', 'info');
+    print('  # then open http://localhost:8080/../test/wasm-harness.html', 'info');
+    return;
+  }
+
+  let passed = 0, failed = 0;
+  function check(cond, label) {
+    if (assert(cond, label)) passed++; else failed++;
+  }
+
+  // -- version --
+  print('\n== version ==', 'info');
+  const vPtr = exports.lottie_version();
+  const vLen = exports.lottie_version_len();
+  const version = new TextDecoder().decode(new Uint8Array(exports.memory.buffer, vPtr, vLen));
+  print(`  Version: ${version}`, 'info');
+  check(version.split('.').length === 3, 'version is semver');
+  check(vLen > 0 && vLen < 20, 'version length is reasonable');
+
+  // -- alloc/free --
+  print('\n== alloc/free ==', 'info');
+  const aPtr = exports.lottie_alloc(100);
+  check(aPtr !== 0, 'lottie_alloc returns non-null for 100 bytes');
+  exports.lottie_free(aPtr, 100);
+  check(true, 'lottie_free does not crash');
+
+  // -- parse --
+  print('\n== parse ==', 'info');
+  const minimal = '{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":512,"h":512,"layers":[]}';
+  const parseResult = callWasm(exports, exports.lottie_parse, minimal);
+  check(parseResult !== null, 'parse returns a result');
+  check(parseResult.ok === true, 'parse result ok is true');
+  check(parseResult.version === '5.7.1', 'parse result version matches');
+  check(parseResult.frame_rate === 30, 'parse result frame_rate matches');
+  check(parseResult.width === 512, 'parse result width matches');
+  check(parseResult.height === 512, 'parse result height matches');
+  check(parseResult.layer_count === 0, 'parse result layer_count is 0');
+
+  const badParse = callWasm(exports, exports.lottie_parse, 'not json');
+  check(badParse === null, 'parse returns null for invalid JSON');
+
+  // -- validate --
+  print('\n== validate ==', 'info');
+  const validResult = callWasm(exports, exports.lottie_validate, minimal);
+  check(validResult !== null, 'validate returns a result');
+  check(validResult.valid === true || validResult.errors === 0, 'valid animation passes');
+
+  const badJson = '{"v":"3.0.0","fr":0,"ip":60,"op":60,"w":0,"h":0,"layers":[]}';
+  const invalResult = callWasm(exports, exports.lottie_validate, badJson);
+  check(invalResult !== null, 'validate returns a result for invalid animation');
+  check(invalResult.errors > 0, 'invalid animation has errors');
+  check(Array.isArray(invalResult.issues), 'issues is an array');
+
+  // -- compile_frame --
+  print('\n== compile_frame ==', 'info');
+  const animJson = '{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":100,"h":100,"layers":[{"ty":4,"ip":0,"op":60,"ks":{"o":{"a":1,"k":[{"t":0,"s":[100]},{"t":60,"s":[0]}]}}}]}';
+  const frame0 = callWasmFrame(exports, exports.lottie_compile_frame, animJson, 0);
+  check(frame0 !== null, 'compile_frame returns a result');
+  check(frame0.frame === 0, 'frame number is 0');
+  check(Array.isArray(frame0.layers), 'layers is an array');
+  check(frame0.layers.length === 1, 'has 1 layer');
+  check(frame0.layers[0].visible === true, 'layer is visible at frame 0');
+  check(frame0.layers[0].transform !== undefined, 'layer has transform');
+
+  const opacity0 = frame0.layers[0].transform.opacity;
+  check(opacity0 >= 99 && opacity0 <= 101, `opacity at frame 0 is ~100 (got ${opacity0})`);
+
+  const frame30 = callWasmFrame(exports, exports.lottie_compile_frame, animJson, 30);
+  check(frame30 !== null, 'compile_frame at frame 30 returns a result');
+  const opacity30 = frame30.layers[0].transform.opacity;
+  check(opacity30 >= 45 && opacity30 <= 55, `opacity at frame 30 is ~50 (got ${opacity30})`);
+
+  const frame59 = callWasmFrame(exports, exports.lottie_compile_frame, animJson, 59);
+  const opacity59 = frame59.layers[0].transform.opacity;
+  check(opacity59 < 5, `opacity at frame 59 is near 0 (got ${opacity59})`);
+
+  // -- compile (full) --
+  print('\n== compile (full) ==', 'info');
+  const shortJson = '{"v":"5.7.1","fr":30,"ip":0,"op":10,"w":100,"h":100,"layers":[{"ty":4,"ip":0,"op":10}]}';
+  const compiled = callWasm(exports, exports.lottie_compile, shortJson);
+  check(compiled !== null, 'compile returns a result');
+  check(compiled.frame_count === 10, `frame_count is 10 (got ${compiled.frame_count})`);
+  check(compiled.frame_rate === 30, 'frame_rate matches');
+  check(compiled.width === 100, 'width matches');
+  check(compiled.height === 100, 'height matches');
+  check(Array.isArray(compiled.frames), 'frames is an array');
+  check(compiled.frames.length === 10, `frames array has 10 entries (got ${compiled.frames.length})`);
+  check(compiled.frames[0].frame === 0, 'first frame is 0');
+  check(compiled.frames[9].frame === 9, 'last frame is 9');
+
+  // -- compile_frame with shapes --
+  print('\n== compile_frame with shapes ==', 'info');
+  const shapeJson = '{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":100,"h":100,"layers":[{"ty":4,"ip":0,"op":60,"shapes":[{"ty":"rc","nm":"Rect","s":{"a":0,"k":[200,100]},"p":{"a":0,"k":[50,50]},"r":{"a":0,"k":10}},{"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":80}}]}]}';
+  const sf = callWasmFrame(exports, exports.lottie_compile_frame, shapeJson, 0);
+  check(sf !== null, 'compile_frame with shapes returns a result');
+  check(sf.layers[0].shapes.length === 2, 'layer has 2 shapes');
+  const rect = sf.layers[0].shapes[0];
+  check(rect.ty === 'rc', 'first shape is rectangle');
+  check(rect.name === 'Rect', 'shape name is Rect');
+  check(rect.size[0] === 200 && rect.size[1] === 100, 'rectangle size is [200, 100]');
+  check(rect.roundness === 10, 'rectangle roundness is 10');
+  const fill = sf.layers[0].shapes[1];
+  check(fill.ty === 'fl', 'second shape is fill');
+  check(fill.color[0] === 1 && fill.color[1] === 0 && fill.color[2] === 0, 'fill color is red');
+  check(fill.opacity === 80, 'fill opacity is 80');
+
+  // -- summary --
+  print(`\n========================================`, 'info');
+  print(`  ${passed + failed} tests: ${passed} passed, ${failed} failed`, failed > 0 ? 'fail' : 'pass');
+  print(`========================================`, 'info');
+}
+
+function runInteractive() {
+  const json = document.getElementById('input').value;
+  if (!wasmExports) {
+    output.textContent = 'WASM not loaded yet';
+    return;
+  }
+  let out = '';
+
+  const parseResult = callWasm(wasmExports, wasmExports.lottie_parse, json);
+  out += '--- Parse ---\n' + JSON.stringify(parseResult, null, 2) + '\n\n';
+
+  const validateResult = callWasm(wasmExports, wasmExports.lottie_validate, json);
+  out += '--- Validate ---\n' + JSON.stringify(validateResult, null, 2) + '\n\n';
+
+  const frameResult = callWasmFrame(wasmExports, wasmExports.lottie_compile_frame, json, 30);
+  out += '--- Compile Frame 30 ---\n' + JSON.stringify(frameResult, null, 2) + '\n';
+
+  output.textContent = out;
+}
+
+runTests();
+</script>
+</body>
+</html>
