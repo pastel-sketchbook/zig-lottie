@@ -795,45 +795,142 @@ export fn lottie_parse(ptr: [*]const u8, len: u32) ?[*]u8 {
     const anim = parse(wasm_allocator, json_buf) catch return null;
     defer anim.deinit();
 
-    // Build a simple JSON result string
+    // Build a simple JSON result string using only integer formatting
+    // to avoid pulling in the full float-to-decimal machinery (~5KB).
     var result: std.ArrayList(u8) = .empty;
-    var writer = result.writer(wasm_allocator);
+    const w = result.writer(wasm_allocator);
 
-    writer.print(
-        \\{{"ok":true,"version":"{s}","frame_rate":{d},"in_point":{d},"out_point":{d},"width":{d},"height":{d},"duration":{d},"layer_count":{d}
-    , .{
-        anim.version_str,
-        anim.frame_rate,
-        anim.in_point,
-        anim.out_point,
-        anim.width,
-        anim.height,
-        anim.duration(),
-        anim.layers.len,
-    }) catch return null;
+    writeStr(w, "{\"ok\":true,\"version\":\"") catch return null;
+    writeStr(w, anim.version_str) catch return null;
+    writeStr(w, "\",\"frame_rate\":") catch return null;
+    writeF64(w, anim.frame_rate) catch return null;
+    writeStr(w, ",\"in_point\":") catch return null;
+    writeF64(w, anim.in_point) catch return null;
+    writeStr(w, ",\"out_point\":") catch return null;
+    writeF64(w, anim.out_point) catch return null;
+    writeStr(w, ",\"width\":") catch return null;
+    writeU32(w, anim.width) catch return null;
+    writeStr(w, ",\"height\":") catch return null;
+    writeU32(w, anim.height) catch return null;
+    writeStr(w, ",\"duration\":") catch return null;
+    writeF64(w, anim.duration()) catch return null;
+    writeStr(w, ",\"layer_count\":") catch return null;
+    writeUsize(w, anim.layers.len) catch return null;
 
     // Add name if present
     if (anim.name) |name| {
-        writer.print(",\"name\":\"{s}\"", .{name}) catch return null;
+        writeStr(w, ",\"name\":\"") catch return null;
+        writeStr(w, name) catch return null;
+        writeStr(w, "\"") catch return null;
     }
 
     // Add layers summary
-    writer.print(",\"layers\":[", .{}) catch return null;
+    writeStr(w, ",\"layers\":[") catch return null;
     for (anim.layers, 0..) |layer, i| {
-        if (i > 0) writer.print(",", .{}) catch return null;
-        writer.print("{{\"ty\":{d}", .{@intFromEnum(layer.ty)}) catch return null;
+        if (i > 0) writeStr(w, ",") catch return null;
+        writeStr(w, "{\"ty\":") catch return null;
+        writeUsize(w, @intFromEnum(layer.ty)) catch return null;
         if (layer.name) |name| {
-            writer.print(",\"name\":\"{s}\"", .{name}) catch return null;
+            writeStr(w, ",\"name\":\"") catch return null;
+            writeStr(w, name) catch return null;
+            writeStr(w, "\"") catch return null;
         }
-        writer.print(",\"shapes\":{d}", .{layer.shapes.len}) catch return null;
-        writer.print(",\"has_transform\":{s}", .{if (layer.transform != null) "true" else "false"}) catch return null;
-        writer.print("}}", .{}) catch return null;
+        writeStr(w, ",\"shapes\":") catch return null;
+        writeUsize(w, layer.shapes.len) catch return null;
+        writeStr(w, ",\"has_transform\":") catch return null;
+        writeStr(w, if (layer.transform != null) "true" else "false") catch return null;
+        writeStr(w, "}") catch return null;
     }
-    writer.print("]}}", .{}) catch return null;
+    writeStr(w, "]}") catch return null;
 
-    // Null-terminate for convenience but return length via separate call
     const slice = result.toOwnedSlice(wasm_allocator) catch return null;
     return slice.ptr;
+}
+
+/// Write a raw string.
+fn writeStr(w: anytype, s: []const u8) !void {
+    try w.writeAll(s);
+}
+
+/// Write a u32 as decimal without pulling in std.fmt.formatFloat.
+fn writeU32(w: anytype, v: u32) !void {
+    var buf: [10]u8 = undefined;
+    var i: usize = buf.len;
+    var n = v;
+    if (n == 0) {
+        try w.writeByte('0');
+        return;
+    }
+    while (n > 0) {
+        i -= 1;
+        buf[i] = @intCast('0' + (n % 10));
+        n /= 10;
+    }
+    try w.writeAll(buf[i..]);
+}
+
+/// Write a usize as decimal.
+fn writeUsize(w: anytype, v: usize) !void {
+    var buf: [20]u8 = undefined;
+    var i: usize = buf.len;
+    var n = v;
+    if (n == 0) {
+        try w.writeByte('0');
+        return;
+    }
+    while (n > 0) {
+        i -= 1;
+        buf[i] = @intCast('0' + (n % 10));
+        n /= 10;
+    }
+    try w.writeAll(buf[i..]);
+}
+
+/// Write an f64 as a fixed-point number with up to 4 decimal places.
+/// Avoids std.fmt float formatting (Dragonbox/Ryu tables).
+fn writeF64(w: anytype, v: f64) !void {
+    const neg = v < 0;
+    const abs = if (neg) -v else v;
+    if (neg) try w.writeByte('-');
+
+    const int_part: u64 = @intFromFloat(abs);
+    const frac = abs - @as(f64, @floatFromInt(int_part));
+    // Scale to 4 decimal places
+    const frac_scaled: u64 = @intFromFloat(frac * 10000 + 0.5);
+
+    // Write integer part
+    var buf: [20]u8 = undefined;
+    var i: usize = buf.len;
+    var n = int_part;
+    if (n == 0) {
+        try w.writeByte('0');
+    } else {
+        while (n > 0) {
+            i -= 1;
+            buf[i] = @intCast('0' + (n % 10));
+            n /= 10;
+        }
+        try w.writeAll(buf[i..]);
+    }
+
+    // Write fractional part (trimming trailing zeros)
+    if (frac_scaled > 0) {
+        var digits: [4]u8 = undefined;
+        var f = frac_scaled;
+        var di: usize = 4;
+        while (di > 0) {
+            di -= 1;
+            digits[di] = @intCast('0' + (f % 10));
+            f /= 10;
+        }
+        // Trim trailing zeros
+        var last: usize = 4;
+        while (last > 0 and digits[last - 1] == '0') last -= 1;
+        if (last > 0) {
+            try w.writeByte('.');
+            try w.writeAll(digits[0..last]);
+        }
+    }
 }
 
 /// Get the length of the last parse result (convenience for JS).

@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
             .os_tag = .freestanding,
         }),
         .optimize = .ReleaseSmall,
+        .strip = true,
     });
 
     const wasm_lib = b.addExecutable(.{
