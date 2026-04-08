@@ -29,6 +29,13 @@ pub fn main() !void {
             std.process.exit(1);
         };
         try inspectFile(path, stdout, stderr);
+    } else if (std.mem.eql(u8, subcommand, "validate")) {
+        const path = args.next() orelse {
+            try stderr.print("error: validate requires a file path\n", .{});
+            stderr.flush() catch {};
+            std.process.exit(1);
+        };
+        try validateFile(path, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "help")) {
         try printUsage(stdout);
     } else {
@@ -41,26 +48,7 @@ pub fn main() !void {
 
 fn inspectFile(path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer) !void {
     const allocator = std.heap.page_allocator;
-
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-        try stderr.print("error: cannot open '{s}': {}\n", .{ path, err });
-        stderr.flush() catch {};
-        std.process.exit(1);
-    };
-    defer file.close();
-
-    const contents = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch |err| {
-        try stderr.print("error: cannot read '{s}': {}\n", .{ path, err });
-        stderr.flush() catch {};
-        std.process.exit(1);
-    };
-    defer allocator.free(contents);
-
-    const anim = lottie.parse(allocator, contents) catch |err| {
-        try stderr.print("error: failed to parse '{s}': {}\n", .{ path, err });
-        stderr.flush() catch {};
-        std.process.exit(1);
-    };
+    const anim = loadAndParse(allocator, path, stderr);
     defer anim.deinit();
 
     try writer.print("File:       {s}\n", .{path});
@@ -74,6 +62,65 @@ fn inspectFile(path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer)
     }
     try writer.print("Layers:     {d}\n", .{anim.layers.len});
 
+    // Layer type counts
+    var layer_type_counts = [_]usize{0} ** 16;
+    for (anim.layers) |layer| {
+        const idx = @intFromEnum(layer.ty);
+        if (idx < 16) layer_type_counts[idx] += 1;
+    }
+    try writer.print("            ", .{});
+    var first_lt = true;
+    const lt_names = [_][]const u8{
+        "precomp",    "solid",             "image",     "null",  "shape",             "text",
+        "audio",      "video_placeholder", "image_seq", "video", "image_placeholder", "guide",
+        "adjustment", "camera",            "light",     "data",
+    };
+    for (layer_type_counts, 0..) |count, ti| {
+        if (count == 0) continue;
+        if (!first_lt) try writer.print(", ", .{});
+        first_lt = false;
+        try writer.print("{d} {s}", .{ count, lt_names[ti] });
+    }
+    try writer.print("\n", .{});
+
+    // Shape type and keyframe summary
+    var shape_counts = [_]usize{0} ** 15;
+    var total_keyframes: usize = 0;
+    for (anim.layers) |layer| {
+        countShapeTypes(layer.shapes, &shape_counts);
+        total_keyframes += countKeyframes(layer.transform);
+        for (layer.shapes) |shape| {
+            total_keyframes += countShapeKeyframes(shape);
+        }
+    }
+
+    // Print shape summary if any shapes exist
+    var total_shapes: usize = 0;
+    for (shape_counts) |c| total_shapes += c;
+    if (total_shapes > 0) {
+        try writer.print("Shapes:     {d}\n", .{total_shapes});
+        try writer.print("            ", .{});
+        var first_st = true;
+        const st_names = [_][]const u8{
+            "group",     "rect",      "ellipse",     "path",  "fill", "stroke",
+            "transform", "grad-fill", "grad-stroke", "merge", "trim", "round-corners",
+            "repeater",  "star",      "unknown",
+        };
+        for (shape_counts, 0..) |count, si| {
+            if (count == 0) continue;
+            if (!first_st) try writer.print(", ", .{});
+            first_st = false;
+            try writer.print("{d} {s}", .{ count, st_names[si] });
+        }
+        try writer.print("\n", .{});
+    }
+
+    if (total_keyframes > 0) {
+        try writer.print("Keyframes:  {d}\n", .{total_keyframes});
+    }
+
+    // Detailed layer listing
+    try writer.print("\n", .{});
     for (anim.layers, 0..) |layer, i| {
         try writer.print("  [{d}] type={d}", .{ i, @intFromEnum(layer.ty) });
         if (layer.name) |name| {
@@ -93,6 +140,142 @@ fn inspectFile(path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer)
         // Print shapes tree
         try printShapes(writer, layer.shapes, 2);
     }
+
+    // Run validation and display any issues
+    const issues = lottie.validate(allocator, &anim) catch |err| {
+        try stderr.print("warning: validation failed: {}\n", .{err});
+        return;
+    };
+    defer {
+        for (issues) |issue| allocator.free(issue.message);
+        allocator.free(issues);
+    }
+
+    if (issues.len > 0) {
+        try writer.print("\nValidation:\n", .{});
+        try printIssues(writer, issues);
+    }
+}
+
+fn validateFile(path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer) !void {
+    const allocator = std.heap.page_allocator;
+    const anim = loadAndParse(allocator, path, stderr);
+    defer anim.deinit();
+
+    const issues = lottie.validate(allocator, &anim) catch |err| {
+        try stderr.print("error: validation failed: {}\n", .{err});
+        stderr.flush() catch {};
+        std.process.exit(1);
+    };
+    defer {
+        for (issues) |issue| allocator.free(issue.message);
+        allocator.free(issues);
+    }
+
+    if (issues.len == 0) {
+        try writer.print("{s}: valid\n", .{path});
+        return;
+    }
+
+    try writer.print("{s}:\n", .{path});
+    try printIssues(writer, issues);
+
+    // Count errors
+    var errors: usize = 0;
+    for (issues) |issue| {
+        if (issue.severity == .@"error") errors += 1;
+    }
+    const warnings = issues.len - errors;
+
+    try writer.print("\n{d} error(s), {d} warning(s)\n", .{ errors, warnings });
+
+    if (errors > 0) {
+        writer.flush() catch {};
+        stderr.flush() catch {};
+        std.process.exit(1);
+    }
+}
+
+fn loadAndParse(allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.Writer) lottie.Animation {
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        stderr.print("error: cannot open '{s}': {}\n", .{ path, err }) catch {};
+        stderr.flush() catch {};
+        std.process.exit(1);
+    };
+    defer file.close();
+
+    const contents = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch |err| {
+        stderr.print("error: cannot read '{s}': {}\n", .{ path, err }) catch {};
+        stderr.flush() catch {};
+        std.process.exit(1);
+    };
+    defer allocator.free(contents);
+
+    return lottie.parse(allocator, contents) catch |err| {
+        stderr.print("error: failed to parse '{s}': {}\n", .{ path, err }) catch {};
+        stderr.flush() catch {};
+        std.process.exit(1);
+    };
+}
+
+fn printIssues(writer: *std.Io.Writer, issues: []const lottie.ValidationIssue) !void {
+    for (issues) |issue| {
+        const prefix: []const u8 = switch (issue.severity) {
+            .@"error" => "  ERROR: ",
+            .warning => "  WARN:  ",
+        };
+        try writer.print("{s}{s}\n", .{ prefix, issue.message });
+    }
+}
+
+fn countShapeTypes(shapes: []const lottie.Shape, counts: *[15]usize) void {
+    for (shapes) |shape| {
+        const idx = @intFromEnum(shape.ty);
+        if (idx < 15) counts[idx] += 1;
+        countShapeTypes(shape.items, counts);
+    }
+}
+
+fn countKeyframes(transform: ?lottie.Transform) usize {
+    const tr = transform orelse return 0;
+    var n: usize = 0;
+    n += countAnimatedMultiKfs(tr.anchor);
+    n += countAnimatedMultiKfs(tr.position);
+    n += countAnimatedMultiKfs(tr.scale);
+    n += countAnimatedValueKfs(tr.rotation);
+    n += countAnimatedValueKfs(tr.opacity);
+    return n;
+}
+
+fn countAnimatedValueKfs(av: ?lottie.AnimatedValue) usize {
+    const v = av orelse return 0;
+    return switch (v) {
+        .keyframed => |kfs| kfs.len,
+        .static => 0,
+    };
+}
+
+fn countAnimatedMultiKfs(am: ?lottie.AnimatedMulti) usize {
+    const v = am orelse return 0;
+    return switch (v) {
+        .keyframed => |kfs| kfs.len,
+        .static => 0,
+    };
+}
+
+fn countShapeKeyframes(shape: lottie.Shape) usize {
+    var n: usize = 0;
+    n += countAnimatedMultiKfs(shape.size);
+    n += countAnimatedMultiKfs(shape.position);
+    n += countAnimatedValueKfs(shape.roundness);
+    n += countAnimatedMultiKfs(shape.color);
+    n += countAnimatedValueKfs(shape.opacity);
+    n += countAnimatedValueKfs(shape.stroke_width);
+    n += countKeyframes(shape.transform);
+    for (shape.items) |item| {
+        n += countShapeKeyframes(item);
+    }
+    return n;
 }
 
 fn printShapes(writer: *std.Io.Writer, shapes: []const lottie.Shape, depth: usize) !void {
@@ -142,6 +325,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\Commands:
         \\  version            Print version
         \\  inspect <file>     Parse and display Lottie animation info
+        \\  validate <file>    Validate a Lottie file for semantic correctness
         \\  help               Show this help
         \\
     , .{});
