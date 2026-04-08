@@ -631,24 +631,32 @@ fn parseSingleShape(allocator: Allocator, obj: std.json.ObjectMap) ParseError!Sh
     }
     errdefer freeShapes(allocator, items);
 
-    // Rectangle / Ellipse fields
-    const size = if (obj.get("s")) |s| try parseAnimatedMulti(allocator, s) else null;
+    // Parse fields conditionally by shape type to avoid misinterpreting
+    // short field names that mean different things per shape type.
+    // e.g. "r" = roundness (rectangle), fill rule (fill), rotation (transform)
+    // e.g. "o" = opacity (fill/stroke), but bare integer elsewhere
+    // e.g. "s" = size (rect/ellipse), scale (transform), start value (keyframe)
+
+    // Rectangle / Ellipse: size ("s"), position ("p"), roundness ("r")
+    const has_geometry = ty == .rectangle or ty == .ellipse;
+    const size = if (has_geometry) if (obj.get("s")) |s| try parseAnimatedMulti(allocator, s) else null else null;
     errdefer freeAnimatedMulti(allocator, size);
 
-    const position = if (obj.get("p")) |p| try parseAnimatedMulti(allocator, p) else null;
+    const position = if (has_geometry) if (obj.get("p")) |p| try parseAnimatedMulti(allocator, p) else null else null;
     errdefer freeAnimatedMulti(allocator, position);
 
-    const roundness = if (obj.get("r")) |r| try parseAnimatedScalar(allocator, r) else null;
+    const roundness = if (ty == .rectangle) if (obj.get("r")) |r| try parseAnimatedScalar(allocator, r) else null else null;
     errdefer freeAnimatedValue(allocator, roundness);
 
-    // Fill / Stroke fields
-    const color = if (obj.get("c")) |c| try parseAnimatedMulti(allocator, c) else null;
+    // Fill / Stroke: color ("c"), opacity ("o"), stroke width ("w")
+    const has_style = ty == .fill or ty == .stroke;
+    const color = if (has_style) if (obj.get("c")) |c| try parseAnimatedMulti(allocator, c) else null else null;
     errdefer freeAnimatedMulti(allocator, color);
 
-    const opacity = if (obj.get("o")) |o| try parseAnimatedScalar(allocator, o) else null;
+    const opacity = if (has_style) if (obj.get("o")) |o| try parseAnimatedScalar(allocator, o) else null else null;
     errdefer freeAnimatedValue(allocator, opacity);
 
-    const stroke_width = if (obj.get("w")) |w| try parseAnimatedScalar(allocator, w) else null;
+    const stroke_width = if (ty == .stroke) if (obj.get("w")) |w| try parseAnimatedScalar(allocator, w) else null else null;
     errdefer freeAnimatedValue(allocator, stroke_width);
 
     // Shape-level transform (inside group's "it" array, ty="tr")
@@ -1448,4 +1456,190 @@ test "parse rejects shape missing ty" {
     ;
     const result = parse(testing.allocator, json);
     try testing.expectError(ParseError.MissingRequiredField, result);
+}
+
+// ---------------------------------------------------------------
+// Integration tests — complex fixture files
+// ---------------------------------------------------------------
+
+fn readFixture(path: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(testing.allocator, 4 * 1024 * 1024);
+}
+
+test "fixture: many_layers.json (148KB, 50 layers)" {
+    const json = try readFixture("test/fixtures/many_layers.json");
+    defer testing.allocator.free(json);
+
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    try testing.expectEqualStrings("5.7.1", anim.version_str);
+    try testing.expectEqual(@as(u32, 1024), anim.width);
+    try testing.expectEqual(@as(u32, 1024), anim.height);
+    try testing.expectEqual(@as(f64, 30.0), anim.frame_rate);
+    try testing.expectEqual(@as(usize, 50), anim.layers.len);
+    try testing.expectEqualStrings("Many Layers", anim.name.?);
+
+    // Every layer should be a shape layer with one group
+    for (anim.layers) |layer| {
+        try testing.expectEqual(LayerType.shape, layer.ty);
+        try testing.expect(layer.name != null);
+        try testing.expect(layer.transform != null);
+        try testing.expectEqual(@as(usize, 1), layer.shapes.len);
+        try testing.expectEqual(ShapeType.group, layer.shapes[0].ty);
+        try testing.expect(layer.shapes[0].items.len >= 3);
+    }
+}
+
+test "fixture: many_keyframes.json (247KB, orbital animation)" {
+    const json = try readFixture("test/fixtures/many_keyframes.json");
+    defer testing.allocator.free(json);
+
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    try testing.expectEqualStrings("5.7.1", anim.version_str);
+    try testing.expectEqual(@as(u32, 1024), anim.width);
+    try testing.expectEqual(@as(u32, 1024), anim.height);
+    try testing.expectEqual(@as(f64, 60.0), anim.frame_rate);
+    try testing.expectEqual(@as(usize, 8), anim.layers.len);
+    try testing.expectEqualStrings("Many Keyframes", anim.name.?);
+
+    // Every layer should have animated transforms (at least scale and opacity)
+    for (anim.layers) |layer| {
+        try testing.expect(layer.transform != null);
+        const tr = layer.transform.?;
+
+        // Scale should be keyframed on all layers
+        try testing.expect(tr.scale != null);
+        switch (tr.scale.?) {
+            .keyframed => |kfs| try testing.expect(kfs.len >= 10),
+            .static => return error.TestUnexpectedResult,
+        }
+
+        // Opacity should be keyframed on all layers
+        try testing.expect(tr.opacity != null);
+        switch (tr.opacity.?) {
+            .keyframed => |kfs| try testing.expect(kfs.len >= 10),
+            .static => return error.TestUnexpectedResult,
+        }
+    }
+
+    // Orbiter layers (1-7) should have keyframed position
+    for (anim.layers[1..]) |layer| {
+        const tr = layer.transform.?;
+        try testing.expect(tr.position != null);
+        switch (tr.position.?) {
+            .keyframed => |kfs| try testing.expect(kfs.len >= 30),
+            .static => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "fixture: deep_nesting.json (414KB, fractal garden)" {
+    const json = try readFixture("test/fixtures/deep_nesting.json");
+    defer testing.allocator.free(json);
+
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    try testing.expectEqualStrings("5.7.1", anim.version_str);
+    try testing.expectEqual(@as(u32, 800), anim.width);
+    try testing.expectEqual(@as(u32, 600), anim.height);
+    try testing.expectEqual(@as(f64, 30.0), anim.frame_rate);
+    try testing.expectEqual(@as(usize, 8), anim.layers.len);
+    try testing.expectEqualStrings("Deep Nesting", anim.name.?);
+
+    // Helper: find first group in a shape slice
+    const findGroup = struct {
+        fn f(shapes: []const Shape) ?Shape {
+            for (shapes) |s| {
+                if (s.ty == .group) return s;
+            }
+            return null;
+        }
+    }.f;
+
+    // Verify 5-level nesting by walking the first tree (Oak)
+    const layer0 = anim.layers[0];
+    try testing.expect(layer0.shapes.len >= 1);
+    const g1 = layer0.shapes[0];
+    try testing.expectEqual(ShapeType.group, g1.ty);
+    try testing.expect(g1.items.len >= 2); // child branches + transform
+
+    // Level 2: first child branch
+    const g2 = findGroup(g1.items) orelse return error.TestUnexpectedResult;
+    try testing.expect(g2.items.len >= 3); // trunk + fill + child + transform
+
+    // Level 3
+    const g3 = findGroup(g2.items) orelse return error.TestUnexpectedResult;
+    try testing.expect(g3.items.len >= 3);
+
+    // Level 4
+    const g4 = findGroup(g3.items) orelse return error.TestUnexpectedResult;
+    try testing.expect(g4.items.len >= 3);
+
+    // Level 5 (innermost leaf group)
+    const g5 = findGroup(g4.items) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(ShapeType.group, g5.ty);
+    try testing.expect(g5.items.len >= 3); // ellipse + fill + transform
+}
+
+test "fixture: kitchen_sink.json (282KB, clockwork aquarium)" {
+    const json = try readFixture("test/fixtures/kitchen_sink.json");
+    defer testing.allocator.free(json);
+
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    try testing.expectEqualStrings("5.12.2", anim.version_str);
+    try testing.expectEqual(@as(u32, 1920), anim.width);
+    try testing.expectEqual(@as(u32, 1080), anim.height);
+    try testing.expectEqual(@as(f64, 60.0), anim.frame_rate);
+    try testing.expectEqual(@as(usize, 20), anim.layers.len);
+    try testing.expectEqualStrings("Kitchen Sink", anim.name.?);
+
+    // Count layer types
+    var null_count: usize = 0;
+    var precomp_count: usize = 0;
+    var shape_count: usize = 0;
+    for (anim.layers) |layer| {
+        switch (layer.ty) {
+            .null_object => null_count += 1,
+            .precomp => precomp_count += 1,
+            .shape => shape_count += 1,
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), null_count);
+    try testing.expectEqual(@as(usize, 2), precomp_count);
+    try testing.expectEqual(@as(usize, 15), shape_count);
+
+    // Verify parent references exist (some layers should have parent set)
+    var parented: usize = 0;
+    for (anim.layers) |layer| {
+        if (layer.parent != null) parented += 1;
+    }
+    try testing.expect(parented >= 3);
+
+    // Verify we parsed a variety of shape types
+    var has_path = false;
+    var has_trim = false;
+    var has_round_corners = false;
+    for (anim.layers) |layer| {
+        for (layer.shapes) |shape| {
+            if (shape.ty == .group) {
+                for (shape.items) |item| {
+                    if (item.ty == .path) has_path = true;
+                    if (item.ty == .trim) has_trim = true;
+                    if (item.ty == .round_corners) has_round_corners = true;
+                }
+            }
+        }
+    }
+    try testing.expect(has_path);
+    try testing.expect(has_trim);
+    try testing.expect(has_round_corners);
 }
