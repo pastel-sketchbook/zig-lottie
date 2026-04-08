@@ -265,6 +265,122 @@ pub const ParseError = error{
 };
 
 // ---------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------
+
+/// Severity of a validation issue.
+pub const Severity = enum {
+    @"error",
+    warning,
+};
+
+/// A single validation issue found in a parsed animation.
+pub const ValidationIssue = struct {
+    severity: Severity,
+    message: []const u8,
+};
+
+/// Validate a parsed animation for semantic correctness.
+/// Returns a list of issues (errors and warnings). An animation is
+/// considered valid when the list contains zero error-severity issues.
+/// Caller owns the returned slice and each message string.
+pub fn validate(allocator: Allocator, anim: *const Animation) ![]ValidationIssue {
+    var issues: std.ArrayList(ValidationIssue) = .empty;
+    errdefer {
+        for (issues.items) |issue| allocator.free(issue.message);
+        issues.deinit(allocator);
+    }
+
+    // -- Animation-level errors --
+
+    if (anim.frame_rate <= 0) {
+        try addIssue(allocator, &issues, .@"error", "frame_rate must be positive, got {d}", .{anim.frame_rate});
+    }
+
+    if (anim.out_point <= anim.in_point) {
+        try addIssue(allocator, &issues, .@"error", "out_point ({d}) must be greater than in_point ({d})", .{ anim.out_point, anim.in_point });
+    }
+
+    if (anim.width == 0) {
+        try addIssue(allocator, &issues, .@"error", "width must be positive", .{});
+    }
+
+    if (anim.height == 0) {
+        try addIssue(allocator, &issues, .@"error", "height must be positive", .{});
+    }
+
+    // Version check: Lottie spec versions 4.x and 5.x are well-known.
+    // Versions below 4.0.0 are considered unsupported.
+    if (!isVersionSupported(anim.version_str)) {
+        try addIssue(allocator, &issues, .@"error", "unsupported Lottie version \"{s}\" (expected 4.x or 5.x)", .{anim.version_str});
+    }
+
+    // -- Layer-level checks --
+
+    if (anim.layers.len == 0) {
+        try addIssue(allocator, &issues, .warning, "animation has no layers", .{});
+    }
+
+    // Collect layer indices for parent ref and duplicate checks.
+    for (anim.layers, 0..) |layer, li| {
+        // Layer timing
+        if (layer.out_point < layer.in_point) {
+            try addIssue(allocator, &issues, .warning, "layer {d}: out_point ({d}) is before in_point ({d})", .{ li, layer.out_point, layer.in_point });
+        }
+
+        // Dangling parent reference
+        if (layer.parent) |parent_idx| {
+            var found = false;
+            for (anim.layers) |other| {
+                if (other.index) |idx| {
+                    if (idx == parent_idx) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                try addIssue(allocator, &issues, .@"error", "layer {d}: parent index {d} does not match any layer", .{ li, parent_idx });
+            }
+        }
+    }
+
+    // Duplicate layer indices
+    for (anim.layers, 0..) |layer, i| {
+        const idx = layer.index orelse continue;
+        for (anim.layers[i + 1 ..], 0..) |other, j_off| {
+            const other_idx = other.index orelse continue;
+            if (idx == other_idx) {
+                try addIssue(allocator, &issues, .warning, "duplicate layer index {d} (layers {d} and {d})", .{ idx, i, i + 1 + j_off });
+                break; // one warning per pair is enough
+            }
+        }
+    }
+
+    return issues.toOwnedSlice(allocator);
+}
+
+fn addIssue(
+    allocator: Allocator,
+    issues: *std.ArrayList(ValidationIssue),
+    severity: Severity,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    issues.append(allocator, .{ .severity = severity, .message = message }) catch |err| {
+        allocator.free(message);
+        return err;
+    };
+}
+
+fn isVersionSupported(ver: []const u8) bool {
+    if (ver.len == 0) return false;
+    const major = ver[0];
+    return major == '4' or major == '5';
+}
+
+// ---------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------
 
@@ -854,6 +970,67 @@ export fn lottie_parse(ptr: [*]const u8, len: u32) ?[*]u8 {
 
     const slice = result.toOwnedSlice(wasm_allocator) catch return null;
     return slice.ptr;
+}
+
+/// Validate a Lottie JSON buffer already in WASM memory.
+/// Returns a pointer to a JSON result string, or null on error.
+/// Result format: `{ "valid": true/false, "errors": N, "warnings": N, "issues": [...] }`
+export fn lottie_validate(ptr: [*]const u8, len: u32) ?[*]u8 {
+    const json_buf = ptr[0..len];
+    const anim = parse(wasm_allocator, json_buf) catch return null;
+    defer anim.deinit();
+
+    const issues = validate(wasm_allocator, &anim) catch return null;
+    defer {
+        for (issues) |issue| wasm_allocator.free(issue.message);
+        wasm_allocator.free(issues);
+    }
+
+    var errors: usize = 0;
+    var warnings: usize = 0;
+    for (issues) |issue| {
+        switch (issue.severity) {
+            .@"error" => errors += 1,
+            .warning => warnings += 1,
+        }
+    }
+
+    var result: std.ArrayList(u8) = .empty;
+    const w = result.writer(wasm_allocator);
+
+    writeStr(w, "{\"valid\":") catch return null;
+    writeStr(w, if (errors == 0) "true" else "false") catch return null;
+    writeStr(w, ",\"errors\":") catch return null;
+    writeUsize(w, errors) catch return null;
+    writeStr(w, ",\"warnings\":") catch return null;
+    writeUsize(w, warnings) catch return null;
+    writeStr(w, ",\"issues\":[") catch return null;
+
+    for (issues, 0..) |issue, i| {
+        if (i > 0) writeStr(w, ",") catch return null;
+        writeStr(w, "{\"severity\":\"") catch return null;
+        writeStr(w, switch (issue.severity) {
+            .@"error" => "error",
+            .warning => "warning",
+        }) catch return null;
+        writeStr(w, "\",\"message\":\"") catch return null;
+        // Escape any quotes in the message
+        for (issue.message) |c| {
+            if (c == '"') {
+                w.writeAll("\\\"") catch return null;
+            } else if (c == '\\') {
+                w.writeAll("\\\\") catch return null;
+            } else {
+                w.writeByte(c) catch return null;
+            }
+        }
+        writeStr(w, "\"}") catch return null;
+    }
+
+    writeStr(w, "]}") catch return null;
+
+    const out = result.toOwnedSlice(wasm_allocator) catch return null;
+    return out.ptr;
 }
 
 /// Write a raw string.
@@ -1643,4 +1820,191 @@ test "fixture: kitchen_sink.json (282KB, clockwork aquarium)" {
     try testing.expect(has_path);
     try testing.expect(has_trim);
     try testing.expect(has_round_corners);
+}
+
+// ---------------------------------------------------------------
+// Validation tests
+// ---------------------------------------------------------------
+
+fn parseAndValidate(json: []const u8) !struct { anim: Animation, issues: []ValidationIssue } {
+    const anim = try parse(testing.allocator, json);
+    const issues = try validate(testing.allocator, &anim);
+    return .{ .anim = anim, .issues = issues };
+}
+
+fn hasIssue(issues: []const ValidationIssue, severity: Severity, needle: []const u8) bool {
+    for (issues) |issue| {
+        if (issue.severity == severity and std.mem.indexOf(u8, issue.message, needle) != null) return true;
+    }
+    return false;
+}
+
+fn countErrors(issues: []const ValidationIssue) usize {
+    var n: usize = 0;
+    for (issues) |issue| {
+        if (issue.severity == .@"error") n += 1;
+    }
+    return n;
+}
+
+fn countWarnings(issues: []const ValidationIssue) usize {
+    var n: usize = 0;
+    for (issues) |issue| {
+        if (issue.severity == .warning) n += 1;
+    }
+    return n;
+}
+
+fn freeIssues(allocator: Allocator, issues: []ValidationIssue) void {
+    for (issues) |issue| allocator.free(issue.message);
+    allocator.free(issues);
+}
+
+test "validate: valid minimal animation has no errors" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":512,"h":512,"layers":[]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expectEqual(@as(usize, 0), countErrors(result.issues));
+}
+
+test "validate: zero frame rate is an error" {
+    const json =
+        \\{"v":"5.7.1","fr":0,"ip":0,"op":60,"w":512,"h":512,"layers":[]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expect(hasIssue(result.issues, .@"error", "frame_rate"));
+}
+
+test "validate: negative frame rate is an error" {
+    const json =
+        \\{"v":"5.7.1","fr":-1,"ip":0,"op":60,"w":512,"h":512,"layers":[]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expect(hasIssue(result.issues, .@"error", "frame_rate"));
+}
+
+test "validate: out_point <= in_point is an error" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":60,"op":60,"w":512,"h":512,"layers":[]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expect(hasIssue(result.issues, .@"error", "out_point"));
+}
+
+test "validate: zero width is an error" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":0,"h":512,"layers":[]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expect(hasIssue(result.issues, .@"error", "width"));
+}
+
+test "validate: zero height is an error" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":512,"h":0,"layers":[]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expect(hasIssue(result.issues, .@"error", "height"));
+}
+
+test "validate: unsupported version is an error" {
+    const json =
+        \\{"v":"3.0.0","fr":30,"ip":0,"op":60,"w":512,"h":512,"layers":[]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expect(hasIssue(result.issues, .@"error", "version"));
+}
+
+test "validate: dangling parent reference is an error" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":512,"h":512,"layers":[
+        \\  {"ty":4,"ind":1,"parent":99,"ip":0,"op":60}
+        \\]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expect(hasIssue(result.issues, .@"error", "parent"));
+}
+
+test "validate: duplicate layer indices is a warning" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":512,"h":512,"layers":[
+        \\  {"ty":4,"ind":1,"ip":0,"op":60},
+        \\  {"ty":4,"ind":1,"ip":0,"op":60}
+        \\]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expect(hasIssue(result.issues, .warning, "duplicate"));
+}
+
+test "validate: layer out_point before in_point is a warning" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":512,"h":512,"layers":[
+        \\  {"ty":4,"ind":1,"ip":30,"op":10}
+        \\]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expect(hasIssue(result.issues, .warning, "out_point"));
+}
+
+test "validate: empty animation (no layers) is a warning" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":512,"h":512,"layers":[]}
+    ;
+    const result = try parseAndValidate(json);
+    defer result.anim.deinit();
+    defer freeIssues(testing.allocator, result.issues);
+
+    try testing.expect(hasIssue(result.issues, .warning, "no layers"));
+}
+
+test "validate: valid fixtures have no errors" {
+    const fixtures = [_][]const u8{
+        "test/fixtures/many_layers.json",
+        "test/fixtures/many_keyframes.json",
+        "test/fixtures/deep_nesting.json",
+        "test/fixtures/kitchen_sink.json",
+    };
+    for (fixtures) |path| {
+        const json = try readFixture(path);
+        defer testing.allocator.free(json);
+
+        const anim = try parse(testing.allocator, json);
+        defer anim.deinit();
+
+        const issues = try validate(testing.allocator, &anim);
+        defer freeIssues(testing.allocator, issues);
+
+        try testing.expectEqual(@as(usize, 0), countErrors(issues));
+    }
 }
