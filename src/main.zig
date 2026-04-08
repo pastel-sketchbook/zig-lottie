@@ -1,5 +1,6 @@
 const std = @import("std");
 const lottie = @import("zig-lottie");
+const terminal = @import("terminal");
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -38,6 +39,13 @@ pub fn main() !void {
             std.process.exit(1);
         };
         try validateFile(allocator, path, stdout, stderr);
+    } else if (std.mem.eql(u8, subcommand, "render")) {
+        const path = args.next() orelse {
+            try stderr.print("error: render requires a file path\n", .{});
+            stderr.flush() catch {};
+            std.process.exit(1);
+        };
+        try renderFile(allocator, path, &args, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "help")) {
         try printUsage(stdout);
     } else {
@@ -218,6 +226,100 @@ fn loadAndParse(allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.
     };
 }
 
+fn renderFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    args: *std.process.ArgIterator,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !void {
+    var config = terminal.RenderConfig{};
+
+    // Parse optional flags
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--width")) {
+            const val = args.next() orelse {
+                try stderr.print("error: --width requires a value\n", .{});
+                stderr.flush() catch {};
+                std.process.exit(1);
+            };
+            config.width = std.fmt.parseInt(u32, val, 10) catch {
+                try stderr.print("error: invalid width '{s}'\n", .{val});
+                stderr.flush() catch {};
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--height")) {
+            const val = args.next() orelse {
+                try stderr.print("error: --height requires a value\n", .{});
+                stderr.flush() catch {};
+                std.process.exit(1);
+            };
+            config.height = std.fmt.parseInt(u32, val, 10) catch {
+                try stderr.print("error: invalid height '{s}'\n", .{val});
+                stderr.flush() catch {};
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--frame")) {
+            const val = args.next() orelse {
+                try stderr.print("error: --frame requires a value\n", .{});
+                stderr.flush() catch {};
+                std.process.exit(1);
+            };
+            config.frame = std.fmt.parseFloat(f64, val) catch {
+                try stderr.print("error: invalid frame '{s}'\n", .{val});
+                stderr.flush() catch {};
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--loops")) {
+            const val = args.next() orelse {
+                try stderr.print("error: --loops requires a value\n", .{});
+                stderr.flush() catch {};
+                std.process.exit(1);
+            };
+            config.loops = std.fmt.parseInt(u32, val, 10) catch {
+                try stderr.print("error: invalid loops '{s}'\n", .{val});
+                stderr.flush() catch {};
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--bg")) {
+            const val = args.next() orelse {
+                try stderr.print("error: --bg requires a hex color (RRGGBB)\n", .{});
+                stderr.flush() catch {};
+                std.process.exit(1);
+            };
+            config.background = parseHexColor(val) orelse {
+                try stderr.print("error: invalid color '{s}' (expected RRGGBB)\n", .{val});
+                stderr.flush() catch {};
+                std.process.exit(1);
+            };
+        } else {
+            try stderr.print("error: unknown option '{s}'\n", .{arg});
+            stderr.flush() catch {};
+            std.process.exit(1);
+        }
+    }
+
+    const anim = loadAndParse(allocator, path, stderr);
+    defer anim.deinit();
+
+    // Flush stdout buffer before terminal.render takes over raw output
+    stdout.flush() catch {};
+
+    terminal.render(allocator, &anim, config, stdout) catch |err| {
+        try stderr.print("error: render failed: {}\n", .{err});
+        stderr.flush() catch {};
+        std.process.exit(1);
+    };
+}
+
+fn parseHexColor(hex: []const u8) ?@import("rasterizer").Pixel {
+    if (hex.len != 6) return null;
+    const r = std.fmt.parseInt(u8, hex[0..2], 16) catch return null;
+    const g = std.fmt.parseInt(u8, hex[2..4], 16) catch return null;
+    const b = std.fmt.parseInt(u8, hex[4..6], 16) catch return null;
+    return .{ r, g, b, 255 };
+}
+
 fn printIssues(writer: *std.Io.Writer, issues: []const lottie.ValidationIssue) !void {
     for (issues) |issue| {
         const prefix: []const u8 = switch (issue.severity) {
@@ -323,10 +425,18 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\Usage: zig-lottie <command> [args]
         \\
         \\Commands:
-        \\  version            Print version
-        \\  inspect <file>     Parse and display Lottie animation info
-        \\  validate <file>    Validate a Lottie file for semantic correctness
-        \\  help               Show this help
+        \\  version              Print version
+        \\  inspect <file>       Parse and display Lottie animation info
+        \\  validate <file>      Validate a Lottie file for semantic correctness
+        \\  render <file> [opts] Render animation in terminal (Kitty graphics)
+        \\  help                 Show this help
+        \\
+        \\Render options:
+        \\  --width <N>          Output width in pixels (default: anim width, max 800)
+        \\  --height <N>         Output height in pixels (default: proportional)
+        \\  --frame <N>          Render a single frame number
+        \\  --loops <N>          Number of loops (0 = infinite, default: 1)
+        \\  --bg <RRGGBB>        Background color in hex (default: transparent)
         \\
     , .{});
 }

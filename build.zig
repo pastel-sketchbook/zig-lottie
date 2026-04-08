@@ -19,12 +19,45 @@ pub fn build(b: *std.Build) void {
     });
     lib_mod.addOptions("build_options", versionOptions(b, version));
 
+    // Terminal rendering modules (CLI-only, not WASM)
+    const rasterizer_mod = b.addModule("rasterizer", .{
+        .root_source_file = b.path("src/rasterizer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zig-lottie", .module = lib_mod },
+        },
+    });
+
+    const kitty_mod = b.addModule("kitty", .{
+        .root_source_file = b.path("src/kitty.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "rasterizer", .module = rasterizer_mod },
+        },
+    });
+
+    const terminal_mod = b.addModule("terminal", .{
+        .root_source_file = b.path("src/terminal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zig-lottie", .module = lib_mod },
+            .{ .name = "rasterizer", .module = rasterizer_mod },
+            .{ .name = "kitty", .module = kitty_mod },
+        },
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zig-lottie", .module = lib_mod },
+            .{ .name = "rasterizer", .module = rasterizer_mod },
+            .{ .name = "kitty", .module = kitty_mod },
+            .{ .name = "terminal", .module = terminal_mod },
         },
     });
 
@@ -91,6 +124,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "zig-lottie", .module = lib_mod },
+            .{ .name = "rasterizer", .module = rasterizer_mod },
+            .{ .name = "kitty", .module = kitty_mod },
+            .{ .name = "terminal", .module = terminal_mod },
         },
     });
     const exe_tests = b.addTest(.{
@@ -98,9 +134,56 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // Rasterizer tests
+    const rast_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/rasterizer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zig-lottie", .module = lib_mod },
+        },
+    });
+    const rast_tests = b.addTest(.{
+        .root_module = rast_test_mod,
+    });
+    const run_rast_tests = b.addRunArtifact(rast_tests);
+
+    // Kitty protocol tests
+    const kitty_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/kitty.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "rasterizer", .module = rasterizer_mod },
+        },
+    });
+    const kitty_tests = b.addTest(.{
+        .root_module = kitty_test_mod,
+    });
+    const run_kitty_tests = b.addRunArtifact(kitty_tests);
+
+    // Terminal renderer tests
+    const term_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/terminal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zig-lottie", .module = lib_mod },
+            .{ .name = "rasterizer", .module = rasterizer_mod },
+            .{ .name = "kitty", .module = kitty_mod },
+        },
+    });
+    const term_tests = b.addTest(.{
+        .root_module = term_test_mod,
+    });
+    const run_term_tests = b.addRunArtifact(term_tests);
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_rast_tests.step);
+    test_step.dependOn(&run_kitty_tests.step);
+    test_step.dependOn(&run_term_tests.step);
 }
 
 fn versionOptions(b: *std.Build, ver: []const u8) *std.Build.Step.Options {
