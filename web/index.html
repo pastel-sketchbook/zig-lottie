@@ -3,10 +3,43 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>zig-lottie WASM Test</title>
+    <title>zig-lottie</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Serif:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
     <style>
-      * { box-sizing: border-box; margin: 0; }
-      body { background: #fafafa; }
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html,
+      body,
+      #root {
+        height: 100%;
+        overflow: hidden;
+      }
+      body {
+        font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+        background: #f8f7ff;
+        color: #3b3651;
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+      }
+      h1, h2, h3 {
+        font-family: 'IBM Plex Serif', Georgia, serif;
+      }
+      code,
+      pre,
+      textarea {
+        font-family: 'IBM Plex Mono', ui-monospace, 'Cascadia Code', monospace;
+      }
     </style>
   </head>
   <body>
