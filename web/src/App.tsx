@@ -2,69 +2,16 @@ import type { JSX } from 'solid-js'
 import { createMemo, createResource, createSignal, For, onCleanup, Show } from 'solid-js'
 import { highlightJson } from './highlight'
 import { LottieRenderer } from './renderer'
+import { SAMPLES } from './samples'
 import { loadLottieWasm, type ParseResult } from './wasm'
 
 // ---------------------------------------------------------------------------
 // Sample data
 // ---------------------------------------------------------------------------
 
-const SAMPLE_LOTTIE = JSON.stringify(
-  {
-    v: '5.7.1',
-    fr: 30,
-    ip: 0,
-    op: 90,
-    w: 512,
-    h: 512,
-    nm: 'Bouncing Ball',
-    layers: [
-      {
-        ty: 4,
-        nm: 'Ball',
-        ind: 1,
-        ip: 0,
-        op: 90,
-        ks: {
-          a: { a: 0, k: [0, 0, 0] },
-          p: {
-            a: 1,
-            k: [
-              { t: 0, s: [256, 100, 0] },
-              { t: 30, s: [256, 400, 0] },
-              { t: 60, s: [256, 100, 0] },
-            ],
-          },
-          s: { a: 0, k: [100, 100, 100] },
-          r: { a: 0, k: 0 },
-          o: { a: 0, k: 100 },
-        },
-        shapes: [
-          {
-            ty: 'gr',
-            nm: 'Ball Group',
-            it: [
-              {
-                ty: 'el',
-                nm: 'Circle',
-                s: { a: 0, k: [80, 80] },
-                p: { a: 0, k: [0, 0] },
-              },
-              {
-                ty: 'fl',
-                nm: 'Red Fill',
-                c: { a: 0, k: [1, 0, 0, 1] },
-                o: { a: 0, k: 100 },
-              },
-            ],
-          },
-        ],
-      },
-      { ty: 3, nm: 'Null Controller', ind: 2, ip: 0, op: 90 },
-    ],
-  },
-  null,
-  2,
-)
+function formatSample(index: number): string {
+  return JSON.stringify(SAMPLES[index].json, null, 2)
+}
 
 const LAYER_TYPES: Record<number, string> = {
   0: 'Precomp',
@@ -308,7 +255,8 @@ type Tab = 'parse' | 'render'
 
 export default function App() {
   const [wasm] = createResource(loadLottieWasm)
-  const [jsonInput, setJsonInput] = createSignal(SAMPLE_LOTTIE)
+  const [sampleIndex, setSampleIndex] = createSignal(0)
+  const [jsonInput, setJsonInput] = createSignal(formatSample(0))
   const [result, setResult] = createSignal<ParseResult | null>(null)
   const [error, setError] = createSignal<string | null>(null)
   const [playing, setPlaying] = createSignal(false)
@@ -317,6 +265,17 @@ export default function App() {
 
   let canvasRef: HTMLCanvasElement | undefined
   let renderer: LottieRenderer | null = null
+
+  function selectSample(index: number) {
+    setSampleIndex(index)
+    setJsonInput(formatSample(index))
+    setResult(null)
+    setError(null)
+    if (renderer?.isPlaying()) {
+      renderer.stop()
+      setPlaying(false)
+    }
+  }
 
   function setCanvasRef(el: HTMLCanvasElement) {
     canvasRef = el
@@ -455,6 +414,23 @@ export default function App() {
             }}
           >
             <SectionLabel icon={<IconCode size={14} />} text="Lottie JSON" />
+            <select
+              value={sampleIndex()}
+              onChange={(e) => selectSample(Number(e.currentTarget.value))}
+              style={{
+                'font-size': '0.75rem',
+                'font-family': "'IBM Plex Sans', system-ui, sans-serif",
+                padding: '0.25rem 0.5rem',
+                'border-radius': '5px',
+                border: `1px solid ${C.border}`,
+                background: C.cardBg,
+                color: C.text,
+                cursor: 'pointer',
+                outline: 'none',
+              }}
+            >
+              <For each={SAMPLES}>{(sample, i) => <option value={i()}>{sample.name}</option>}</For>
+            </select>
           </div>
           {/* Overlay editor: highlighted <pre> behind transparent <textarea> */}
           <div
