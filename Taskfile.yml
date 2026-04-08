@@ -47,7 +47,7 @@ tasks:
     desc: Show current version
     silent: true
     cmds:
-      - sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon
+      - cat VERSION
 
   version:patch:
     desc: Bump patch version (0.1.0 → 0.1.1) and tag
@@ -75,10 +75,10 @@ tasks:
     silent: true
     vars:
       CURRENT:
-        sh: sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon
+        sh: cat VERSION | tr -d '\n'
       NEXT:
         sh: |
-          cur=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)
+          cur=$(cat VERSION | tr -d '\n')
           major=${cur%%.*}; rest=${cur#*.}; minor=${rest%%.*}; patch=${rest#*.}
           case "{{.PART}}" in
             patch) echo "$major.$minor.$((patch + 1))" ;;
@@ -89,9 +89,10 @@ tasks:
       - sh: git diff --quiet && git diff --cached --quiet
         msg: "Working tree must be clean before bumping version"
     cmds:
-      - sed -i '' 's/\.version = "{{.CURRENT}}"/.version = "{{.NEXT}}"/' build.zig.zon
-      - sed -i '' 's/pub const version = "{{.CURRENT}}"/pub const version = "{{.NEXT}}"/' src/root.zig
-      - git add build.zig.zon src/root.zig
+      - cmd: printf '%s\n' '{{.NEXT}}' > VERSION
+      - cmd: perl -pi -e 's/\.version = "{{.CURRENT}}"/.version = "{{.NEXT}}"/' build.zig.zon
+      - cmd: perl -pi -e 's/"version":\s*"{{.CURRENT}}"/"version"{{":"}} "{{.NEXT}}"/' web/package.json
+      - cmd: git add VERSION build.zig.zon web/package.json
       - cmd: git commit -m "chore{{":"}} bump version to {{.NEXT}}"
       - cmd: git tag "v{{.NEXT}}"
       - cmd: echo "{{.CURRENT}} → {{.NEXT}} (tagged v{{.NEXT}})"

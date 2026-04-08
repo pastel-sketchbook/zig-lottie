@@ -1,9 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 
-/// Semantic version of the zig-lottie library.
-pub const version = "0.1.0";
+/// Semantic version of the zig-lottie library, read from VERSION at build time.
+pub const version = build_options.version;
 
 // ---------------------------------------------------------------
 // Lottie Schema Types

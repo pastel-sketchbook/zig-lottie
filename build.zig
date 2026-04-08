@@ -2,6 +2,11 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     // ---------------------------------------------------------------
+    // Read VERSION file (single source of truth)
+    // ---------------------------------------------------------------
+    const version = readVersion(b);
+
+    // ---------------------------------------------------------------
     // Native CLI executable
     // ---------------------------------------------------------------
     const target = b.standardTargetOptions(.{});
@@ -12,6 +17,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_mod.addOptions("build_options", versionOptions(b, version));
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -49,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
         .strip = true,
     });
+    wasm_mod.addOptions("build_options", versionOptions(b, version));
 
     const wasm_lib = b.addExecutable(.{
         .name = "zig-lottie",
@@ -71,6 +78,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    lib_test_mod.addOptions("build_options", versionOptions(b, version));
+
     const lib_tests = b.addTest(.{
         .root_module = lib_test_mod,
     });
@@ -92,4 +101,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+}
+
+fn versionOptions(b: *std.Build, ver: []const u8) *std.Build.Step.Options {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", ver);
+    return options;
+}
+
+fn readVersion(b: *std.Build) []const u8 {
+    const path = b.pathFromRoot("VERSION");
+    const data = std.fs.cwd().readFileAlloc(b.allocator, path, 64) catch
+        @panic("cannot read VERSION file");
+    return std.mem.trimRight(u8, data, &.{ '\n', '\r', ' ' });
 }

@@ -1,7 +1,11 @@
+import { readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { defineConfig } from 'vite'
 import solidPlugin from 'vite-plugin-solid'
+
+// Read the single-source-of-truth VERSION file from the repo root.
+const appVersion = readFileSync(join(__dirname, '..', 'VERSION'), 'utf-8').trim()
 
 // Serve test fixture files from /fixtures/* during development
 function fixturesPlugin() {
@@ -42,6 +46,9 @@ interface InRes {
 
 export default defineConfig({
   plugins: [solidPlugin(), fixturesPlugin()],
+  define: {
+    __APP_VERSION__: JSON.stringify(appVersion),
+  },
   server: {
     port: 3000,
   },
