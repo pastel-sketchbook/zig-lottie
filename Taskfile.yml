@@ -43,6 +43,59 @@ tasks:
     cmds:
       - rm -rf .zig-cache zig-out
 
+  version:
+    desc: Show current version
+    silent: true
+    cmds:
+      - sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon
+
+  version:patch:
+    desc: Bump patch version (0.1.0 → 0.1.1) and tag
+    cmds:
+      - task: _version:bump
+        vars:
+          PART: patch
+
+  version:minor:
+    desc: Bump minor version (0.1.0 → 0.2.0) and tag
+    cmds:
+      - task: _version:bump
+        vars:
+          PART: minor
+
+  version:major:
+    desc: Bump major version (0.1.0 → 1.0.0) and tag
+    cmds:
+      - task: _version:bump
+        vars:
+          PART: major
+
+  _version:bump:
+    internal: true
+    silent: true
+    vars:
+      CURRENT:
+        sh: sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon
+      NEXT:
+        sh: |
+          cur=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)
+          major=${cur%%.*}; rest=${cur#*.}; minor=${rest%%.*}; patch=${rest#*.}
+          case "{{.PART}}" in
+            patch) echo "$major.$minor.$((patch + 1))" ;;
+            minor) echo "$major.$((minor + 1)).0" ;;
+            major) echo "$((major + 1)).0.0" ;;
+          esac
+    preconditions:
+      - sh: git diff --quiet && git diff --cached --quiet
+        msg: "Working tree must be clean before bumping version"
+    cmds:
+      - sed -i '' 's/\.version = "{{.CURRENT}}"/.version = "{{.NEXT}}"/' build.zig.zon
+      - sed -i '' 's/pub const version = "{{.CURRENT}}"/pub const version = "{{.NEXT}}"/' src/root.zig
+      - git add build.zig.zon src/root.zig
+      - cmd: git commit -m "chore{{":"}} bump version to {{.NEXT}}"
+      - cmd: git tag "v{{.NEXT}}"
+      - cmd: echo "{{.CURRENT}} → {{.NEXT}} (tagged v{{.NEXT}})"
+
   web:install:
     desc: Install web dependencies
     dir: web
