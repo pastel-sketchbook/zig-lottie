@@ -25,6 +25,7 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, subcommand, "inspect")) {
         const path = args.next() orelse {
             try stderr.print("error: inspect requires a file path\n", .{});
+            stderr.flush() catch {};
             std.process.exit(1);
         };
         try inspectFile(path, stdout, stderr);
@@ -33,6 +34,7 @@ pub fn main() !void {
     } else {
         try stderr.print("error: unknown command '{s}'\n", .{subcommand});
         try printUsage(stderr);
+        stderr.flush() catch {};
         std.process.exit(1);
     }
 }
@@ -42,18 +44,21 @@ fn inspectFile(path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer)
 
     const file = std.fs.cwd().openFile(path, .{}) catch |err| {
         try stderr.print("error: cannot open '{s}': {}\n", .{ path, err });
+        stderr.flush() catch {};
         std.process.exit(1);
     };
     defer file.close();
 
     const contents = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch |err| {
         try stderr.print("error: cannot read '{s}': {}\n", .{ path, err });
+        stderr.flush() catch {};
         std.process.exit(1);
     };
     defer allocator.free(contents);
 
     const anim = lottie.parse(allocator, contents) catch |err| {
         try stderr.print("error: failed to parse '{s}': {}\n", .{ path, err });
+        stderr.flush() catch {};
         std.process.exit(1);
     };
     defer anim.deinit();
