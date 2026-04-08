@@ -90,9 +90,6 @@ pub const ShapeType = enum {
     unknown,
 };
 
-/// Color represented as [r, g, b] with values 0.0-1.0.
-pub const Color = [3]f64;
-
 /// A shape element within a shape layer.
 pub const Shape = struct {
     /// Shape type.
@@ -574,7 +571,7 @@ fn parseAnimatedScalar(allocator: Allocator, val: std.json.Value) ParseError!Ani
     const arr = k_val.array;
 
     var keyframes: std.ArrayList(Keyframe) = .empty;
-    errdefer allocator.free(keyframes.items);
+    errdefer keyframes.deinit(allocator);
 
     for (arr.items) |kf_val| {
         if (kf_val != .object) return ParseError.InvalidJson;
@@ -916,6 +913,10 @@ export fn lottie_free(ptr: [*]u8, len: u32) void {
 /// The caller must free the result with lottie_free.
 /// Result format: `{ "ok": true, "version": "...", "frame_rate": N, ... }`
 export fn lottie_parse(ptr: [*]const u8, len: u32) ?[*]u8 {
+    return lottieParseInner(ptr, len) catch return null;
+}
+
+fn lottieParseInner(ptr: [*]const u8, len: u32) !?[*]u8 {
     const json_buf = ptr[0..len];
     const anim = parse(wasm_allocator, json_buf) catch return null;
     defer anim.deinit();
@@ -923,52 +924,53 @@ export fn lottie_parse(ptr: [*]const u8, len: u32) ?[*]u8 {
     // Build a simple JSON result string using only integer formatting
     // to avoid pulling in the full float-to-decimal machinery (~5KB).
     var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(wasm_allocator);
     const w = result.writer(wasm_allocator);
 
-    writeStr(w, "{\"ok\":true,\"version\":\"") catch return null;
-    writeStr(w, anim.version_str) catch return null;
-    writeStr(w, "\",\"frame_rate\":") catch return null;
-    writeF64(w, anim.frame_rate) catch return null;
-    writeStr(w, ",\"in_point\":") catch return null;
-    writeF64(w, anim.in_point) catch return null;
-    writeStr(w, ",\"out_point\":") catch return null;
-    writeF64(w, anim.out_point) catch return null;
-    writeStr(w, ",\"width\":") catch return null;
-    writeU32(w, anim.width) catch return null;
-    writeStr(w, ",\"height\":") catch return null;
-    writeU32(w, anim.height) catch return null;
-    writeStr(w, ",\"duration\":") catch return null;
-    writeF64(w, anim.duration()) catch return null;
-    writeStr(w, ",\"layer_count\":") catch return null;
-    writeUsize(w, anim.layers.len) catch return null;
+    try writeStr(w, "{\"ok\":true,\"version\":\"");
+    try writeStr(w, anim.version_str);
+    try writeStr(w, "\",\"frame_rate\":");
+    try writeF64(w, anim.frame_rate);
+    try writeStr(w, ",\"in_point\":");
+    try writeF64(w, anim.in_point);
+    try writeStr(w, ",\"out_point\":");
+    try writeF64(w, anim.out_point);
+    try writeStr(w, ",\"width\":");
+    try writeU32(w, anim.width);
+    try writeStr(w, ",\"height\":");
+    try writeU32(w, anim.height);
+    try writeStr(w, ",\"duration\":");
+    try writeF64(w, anim.duration());
+    try writeStr(w, ",\"layer_count\":");
+    try writeUsize(w, anim.layers.len);
 
     // Add name if present
     if (anim.name) |name| {
-        writeStr(w, ",\"name\":\"") catch return null;
-        writeStr(w, name) catch return null;
-        writeStr(w, "\"") catch return null;
+        try writeStr(w, ",\"name\":\"");
+        try writeStr(w, name);
+        try writeStr(w, "\"");
     }
 
     // Add layers summary
-    writeStr(w, ",\"layers\":[") catch return null;
+    try writeStr(w, ",\"layers\":[");
     for (anim.layers, 0..) |layer, i| {
-        if (i > 0) writeStr(w, ",") catch return null;
-        writeStr(w, "{\"ty\":") catch return null;
-        writeUsize(w, @intFromEnum(layer.ty)) catch return null;
+        if (i > 0) try writeStr(w, ",");
+        try writeStr(w, "{\"ty\":");
+        try writeUsize(w, @intFromEnum(layer.ty));
         if (layer.name) |name| {
-            writeStr(w, ",\"name\":\"") catch return null;
-            writeStr(w, name) catch return null;
-            writeStr(w, "\"") catch return null;
+            try writeStr(w, ",\"name\":\"");
+            try writeStr(w, name);
+            try writeStr(w, "\"");
         }
-        writeStr(w, ",\"shapes\":") catch return null;
-        writeUsize(w, layer.shapes.len) catch return null;
-        writeStr(w, ",\"has_transform\":") catch return null;
-        writeStr(w, if (layer.transform != null) "true" else "false") catch return null;
-        writeStr(w, "}") catch return null;
+        try writeStr(w, ",\"shapes\":");
+        try writeUsize(w, layer.shapes.len);
+        try writeStr(w, ",\"has_transform\":");
+        try writeStr(w, if (layer.transform != null) "true" else "false");
+        try writeStr(w, "}");
     }
-    writeStr(w, "]}") catch return null;
+    try writeStr(w, "]}");
 
-    const slice = result.toOwnedSlice(wasm_allocator) catch return null;
+    const slice = try result.toOwnedSlice(wasm_allocator);
     return slice.ptr;
 }
 
@@ -976,6 +978,10 @@ export fn lottie_parse(ptr: [*]const u8, len: u32) ?[*]u8 {
 /// Returns a pointer to a JSON result string, or null on error.
 /// Result format: `{ "valid": true/false, "errors": N, "warnings": N, "issues": [...] }`
 export fn lottie_validate(ptr: [*]const u8, len: u32) ?[*]u8 {
+    return lottieValidateInner(ptr, len) catch return null;
+}
+
+fn lottieValidateInner(ptr: [*]const u8, len: u32) !?[*]u8 {
     const json_buf = ptr[0..len];
     const anim = parse(wasm_allocator, json_buf) catch return null;
     defer anim.deinit();
@@ -996,40 +1002,41 @@ export fn lottie_validate(ptr: [*]const u8, len: u32) ?[*]u8 {
     }
 
     var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(wasm_allocator);
     const w = result.writer(wasm_allocator);
 
-    writeStr(w, "{\"valid\":") catch return null;
-    writeStr(w, if (errors == 0) "true" else "false") catch return null;
-    writeStr(w, ",\"errors\":") catch return null;
-    writeUsize(w, errors) catch return null;
-    writeStr(w, ",\"warnings\":") catch return null;
-    writeUsize(w, warnings) catch return null;
-    writeStr(w, ",\"issues\":[") catch return null;
+    try writeStr(w, "{\"valid\":");
+    try writeStr(w, if (errors == 0) "true" else "false");
+    try writeStr(w, ",\"errors\":");
+    try writeUsize(w, errors);
+    try writeStr(w, ",\"warnings\":");
+    try writeUsize(w, warnings);
+    try writeStr(w, ",\"issues\":[");
 
     for (issues, 0..) |issue, i| {
-        if (i > 0) writeStr(w, ",") catch return null;
-        writeStr(w, "{\"severity\":\"") catch return null;
-        writeStr(w, switch (issue.severity) {
+        if (i > 0) try writeStr(w, ",");
+        try writeStr(w, "{\"severity\":\"");
+        try writeStr(w, switch (issue.severity) {
             .@"error" => "error",
             .warning => "warning",
-        }) catch return null;
-        writeStr(w, "\",\"message\":\"") catch return null;
+        });
+        try writeStr(w, "\",\"message\":\"");
         // Escape any quotes in the message
         for (issue.message) |c| {
             if (c == '"') {
-                w.writeAll("\\\"") catch return null;
+                try w.writeAll("\\\"");
             } else if (c == '\\') {
-                w.writeAll("\\\\") catch return null;
+                try w.writeAll("\\\\");
             } else {
-                w.writeByte(c) catch return null;
+                try w.writeByte(c);
             }
         }
-        writeStr(w, "\"}") catch return null;
+        try writeStr(w, "\"}");
     }
 
-    writeStr(w, "]}") catch return null;
+    try writeStr(w, "]}");
 
-    const out = result.toOwnedSlice(wasm_allocator) catch return null;
+    const out = try result.toOwnedSlice(wasm_allocator);
     return out.ptr;
 }
 

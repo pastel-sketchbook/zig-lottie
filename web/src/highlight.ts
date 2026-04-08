@@ -107,7 +107,7 @@ export function highlightJson(source: string): string {
 // -- Helpers --
 
 function esc(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
 /// Find the end index of a JSON string starting at `start` (which points to the opening `"`).

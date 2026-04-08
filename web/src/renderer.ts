@@ -62,6 +62,18 @@ interface LottieShape {
   o?: AnimProp
   w?: AnimProp
   e?: AnimProp
+  // Shape-level transform fields (ty="tr") reuse the same keys as LottieTransform.
+  a?: AnimProp
+}
+
+function isLottieJson(v: unknown): v is LottieJson {
+  if (typeof v !== 'object' || v === null) return false
+  const o = v as Record<string, unknown>
+  return typeof o.fr === 'number' && typeof o.ip === 'number' && typeof o.op === 'number' && Array.isArray(o.layers)
+}
+
+function isAnimKeyframe(v: unknown): v is AnimKeyframe {
+  return typeof v === 'object' && v !== null && 't' in v && typeof (v as AnimKeyframe).t === 'number'
 }
 
 export class LottieRenderer {
@@ -74,7 +86,9 @@ export class LottieRenderer {
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas
-    this.ctx = canvas.getContext('2d') as CanvasRenderingContext2D
+    const ctx = canvas.getContext('2d')
+    if (!ctx) throw new Error('Canvas 2D context is not available')
+    this.ctx = ctx
   }
 
   get width() {
@@ -87,7 +101,9 @@ export class LottieRenderer {
 
   load(json: string): boolean {
     try {
-      this.anim = JSON.parse(json) as LottieJson
+      const parsed: unknown = JSON.parse(json)
+      if (!isLottieJson(parsed)) return false
+      this.anim = parsed
       this.canvas.width = this.anim.w
       this.canvas.height = this.anim.h
       this.drawFrame(this.anim.ip)
@@ -214,7 +230,7 @@ export class LottieRenderer {
           break
         }
         case 'tr':
-          this.applyTransform(ctx, shape as unknown as LottieTransform, frame)
+          this.applyTransform(ctx, shapeToTransform(shape), frame)
           break
       }
     }
@@ -347,13 +363,20 @@ export class LottieRenderer {
   }
 }
 
+// -- Shape-to-transform adapter --
+
+/// Build a LottieTransform from a shape's direct fields (for ty="tr" shapes).
+function shapeToTransform(shape: LottieShape): LottieTransform {
+  return { a: shape.a, p: shape.p, s: shape.s, r: shape.r, o: shape.o }
+}
+
 // -- Path data resolution --
 
 function resolvePathData(prop: LottieShape['ks'], _frame: number): PathData | null {
   if (!prop) return null
-  const k = (prop as { k: PathData }).k
-  if (k && typeof k === 'object' && 'v' in k) {
-    return k as PathData
+  const k = prop.k
+  if (k && typeof k === 'object' && !Array.isArray(k) && 'v' in k) {
+    return k
   }
   return null
 }
@@ -372,8 +395,8 @@ function resolveScalar(prop: AnimProp | undefined, frame: number, fallback: numb
   if (typeof k === 'number') return k
   if (Array.isArray(k)) {
     if (k.length === 0) return fallback
-    if (typeof k[0] === 'number') return k[0] as number
-    return interpolateScalar(k as AnimKeyframe[], frame, fallback)
+    if (typeof k[0] === 'number') return k[0]
+    if (isAnimKeyframe(k[0])) return interpolateScalar(k as AnimKeyframe[], frame, fallback)
   }
   return fallback
 }
@@ -385,7 +408,7 @@ function resolveMulti(prop: AnimProp | undefined, frame: number, fallback: numbe
   if (Array.isArray(k)) {
     if (k.length === 0) return fallback
     if (typeof k[0] === 'number') return k as number[]
-    return interpolateMulti(k as AnimKeyframe[], frame, fallback)
+    if (isAnimKeyframe(k[0])) return interpolateMulti(k as AnimKeyframe[], frame, fallback)
   }
   return fallback
 }

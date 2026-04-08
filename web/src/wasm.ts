@@ -51,11 +51,36 @@ interface WasmExports {
   lottie_validate: (ptr: number, len: number) => number
 }
 
+function assertWasmExports(exports: WebAssembly.Exports): WasmExports {
+  const required = [
+    'memory',
+    'lottie_version',
+    'lottie_version_len',
+    'lottie_alloc',
+    'lottie_free',
+    'lottie_parse',
+    'lottie_validate',
+  ]
+  for (const name of required) {
+    if (!(name in exports)) throw new Error(`Missing WASM export: ${name}`)
+  }
+  return exports as unknown as WasmExports
+}
+
+function isParseResult(v: unknown): v is ParseResult {
+  return typeof v === 'object' && v !== null && 'ok' in v
+}
+
+function isValidateResult(v: unknown): v is ValidateResult {
+  return typeof v === 'object' && v !== null && 'valid' in v && 'issues' in v
+}
+
 export async function loadLottieWasm(): Promise<LottieWasm> {
   const response = await fetch('/zig-lottie.wasm')
+  if (!response.ok) throw new Error(`Failed to fetch WASM: ${response.status} ${response.statusText}`)
   const bytes = await response.arrayBuffer()
   const { instance } = await WebAssembly.instantiate(bytes, {})
-  const exports = instance.exports as unknown as WasmExports
+  const exports = assertWasmExports(instance.exports)
 
   function version(): string {
     const ptr = exports.lottie_version()
@@ -70,7 +95,9 @@ export async function loadLottieWasm(): Promise<LottieWasm> {
       return { ok: false, error: 'Parse failed' }
     }
     try {
-      return JSON.parse(resultStr) as ParseResult
+      const parsed: unknown = JSON.parse(resultStr)
+      if (isParseResult(parsed)) return parsed
+      return { ok: false, error: `Unexpected response shape: ${resultStr.slice(0, 200)}` }
     } catch {
       return { ok: false, error: `Invalid JSON response: ${resultStr.slice(0, 200)}` }
     }
@@ -82,7 +109,15 @@ export async function loadLottieWasm(): Promise<LottieWasm> {
       return { valid: false, errors: 1, warnings: 0, issues: [], error: 'Validation failed' }
     }
     try {
-      return JSON.parse(resultStr) as ValidateResult
+      const parsed: unknown = JSON.parse(resultStr)
+      if (isValidateResult(parsed)) return parsed
+      return {
+        valid: false,
+        errors: 1,
+        warnings: 0,
+        issues: [],
+        error: `Unexpected response shape: ${resultStr.slice(0, 200)}`,
+      }
     } catch {
       return {
         valid: false,

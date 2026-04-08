@@ -2,6 +2,8 @@ const std = @import("std");
 const lottie = @import("zig-lottie");
 
 pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &stdout_writer.interface;
@@ -28,14 +30,14 @@ pub fn main() !void {
             stderr.flush() catch {};
             std.process.exit(1);
         };
-        try inspectFile(path, stdout, stderr);
+        try inspectFile(allocator, path, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "validate")) {
         const path = args.next() orelse {
             try stderr.print("error: validate requires a file path\n", .{});
             stderr.flush() catch {};
             std.process.exit(1);
         };
-        try validateFile(path, stdout, stderr);
+        try validateFile(allocator, path, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "help")) {
         try printUsage(stdout);
     } else {
@@ -46,8 +48,7 @@ pub fn main() !void {
     }
 }
 
-fn inspectFile(path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer) !void {
-    const allocator = std.heap.page_allocator;
+fn inspectFile(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer) !void {
     const anim = loadAndParse(allocator, path, stderr);
     defer anim.deinit();
 
@@ -157,8 +158,7 @@ fn inspectFile(path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer)
     }
 }
 
-fn validateFile(path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer) !void {
-    const allocator = std.heap.page_allocator;
+fn validateFile(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer) !void {
     const anim = loadAndParse(allocator, path, stderr);
     defer anim.deinit();
 

@@ -3,3 +3,4 @@ zig-out/
 .task/
 node_modules/
 web/dist/
+.env*

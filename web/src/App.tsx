@@ -721,7 +721,8 @@ export default function App() {
               >
                 <Show when={result()?.ok}>
                   {(_ok) => {
-                    const r = result() as ParseResult
+                    const r = result()
+                    if (!r) return null
                     return (
                       <>
                         <Card style={{ 'margin-bottom': '1rem' }}>
