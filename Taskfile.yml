@@ -42,3 +42,39 @@ tasks:
     desc: Clean build artifacts
     cmds:
       - rm -rf .zig-cache zig-out
+
+  web:install:
+    desc: Install web dependencies
+    dir: web
+    cmds:
+      - bun install
+    sources:
+      - web/package.json
+    generates:
+      - web/node_modules/.package-lock.json
+
+  web:dev:
+    desc: Build WASM and start the web dev server
+    deps:
+      - wasm
+      - web:install
+    dir: web
+    cmds:
+      - bunx --bun vite
+
+  web:build:
+    desc: Build WASM and the web production bundle
+    deps:
+      - wasm
+      - web:install
+    dir: web
+    cmds:
+      - bunx --bun vite build
+
+  web:run:
+    desc: Build and serve the web production bundle
+    deps:
+      - web:build
+    dir: web
+    cmds:
+      - bunx --bun vite preview

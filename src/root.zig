@@ -759,6 +759,12 @@ fn jsonFloatArray(allocator: Allocator, arr: std.json.Array) ParseError![]f64 {
 // WASM exports
 // ---------------------------------------------------------------
 
+const is_wasm = builtin.cpu.arch.isWasm();
+const wasm_allocator = if (is_wasm)
+    std.heap.wasm_allocator
+else
+    std.heap.page_allocator;
+
 /// Returns a pointer to the version string (for WASM hosts).
 export fn lottie_version() [*]const u8 {
     return version.ptr;
@@ -767,6 +773,79 @@ export fn lottie_version() [*]const u8 {
 /// Returns the length of the version string.
 export fn lottie_version_len() u32 {
     return version.len;
+}
+
+/// Allocate a buffer in WASM memory (for the host to write JSON into).
+export fn lottie_alloc(len: u32) ?[*]u8 {
+    const slice = wasm_allocator.alloc(u8, len) catch return null;
+    return slice.ptr;
+}
+
+/// Free a buffer previously allocated by lottie_alloc.
+export fn lottie_free(ptr: [*]u8, len: u32) void {
+    wasm_allocator.free(ptr[0..len]);
+}
+
+/// Parse a Lottie JSON buffer already in WASM memory.
+/// Returns a pointer to a JSON result string, or null on error.
+/// The caller must free the result with lottie_free.
+/// Result format: `{ "ok": true, "version": "...", "frame_rate": N, ... }`
+export fn lottie_parse(ptr: [*]const u8, len: u32) ?[*]u8 {
+    const json_buf = ptr[0..len];
+    const anim = parse(wasm_allocator, json_buf) catch return null;
+    defer anim.deinit();
+
+    // Build a simple JSON result string
+    var result: std.ArrayList(u8) = .empty;
+    var writer = result.writer(wasm_allocator);
+
+    writer.print(
+        \\{{"ok":true,"version":"{s}","frame_rate":{d},"in_point":{d},"out_point":{d},"width":{d},"height":{d},"duration":{d},"layer_count":{d}
+    , .{
+        anim.version_str,
+        anim.frame_rate,
+        anim.in_point,
+        anim.out_point,
+        anim.width,
+        anim.height,
+        anim.duration(),
+        anim.layers.len,
+    }) catch return null;
+
+    // Add name if present
+    if (anim.name) |name| {
+        writer.print(",\"name\":\"{s}\"", .{name}) catch return null;
+    }
+
+    // Add layers summary
+    writer.print(",\"layers\":[", .{}) catch return null;
+    for (anim.layers, 0..) |layer, i| {
+        if (i > 0) writer.print(",", .{}) catch return null;
+        writer.print("{{\"ty\":{d}", .{@intFromEnum(layer.ty)}) catch return null;
+        if (layer.name) |name| {
+            writer.print(",\"name\":\"{s}\"", .{name}) catch return null;
+        }
+        writer.print(",\"shapes\":{d}", .{layer.shapes.len}) catch return null;
+        writer.print(",\"has_transform\":{s}", .{if (layer.transform != null) "true" else "false"}) catch return null;
+        writer.print("}}", .{}) catch return null;
+    }
+    writer.print("]}}", .{}) catch return null;
+
+    // Null-terminate for convenience but return length via separate call
+    const slice = result.toOwnedSlice(wasm_allocator) catch return null;
+    return slice.ptr;
+}
+
+/// Get the length of the last parse result (convenience for JS).
+/// This is determined by the JS side reading until null or tracking length.
+export fn lottie_result_len(ptr: [*]const u8) u32 {
+    var i: u32 = 0;
+    while (i < 1024 * 1024) : (i += 1) {
+        if (ptr[i] == 0) return i;
+        // Look for the closing brace of the JSON
+    }
+    // Scan for end of JSON by finding last '}'
+    return i;
 }
 
 // ---------------------------------------------------------------

@@ -1,0 +1,24 @@
+{
+  "name": "zig-lottie-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bunx --bun vite",
+    "build": "bunx --bun vite build",
+    "preview": "bunx --bun vite preview",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "check": "biome check --write .",
+    "check:all": "biome check . && tsc --noEmit && bunx --bun vite build"
+  },
+  "dependencies": {
+    "solid-js": "^1.9.5"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.0.0",
+    "vite": "^8.0.0",
+    "vite-plugin-solid": "^2.11.6",
+    "typescript": "^6.0.0"
+  }
+}
