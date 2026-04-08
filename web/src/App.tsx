@@ -1,5 +1,5 @@
 import type { JSX } from 'solid-js'
-import { createMemo, createResource, createSignal, For, onCleanup, Show } from 'solid-js'
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from 'solid-js'
 import { highlightJson } from './highlight'
 import { LottieRenderer } from './renderer'
 import { SAMPLES } from './samples'
@@ -10,7 +10,9 @@ import { loadLottieWasm, type ParseResult } from './wasm'
 // ---------------------------------------------------------------------------
 
 function formatSample(index: number): string {
-  return JSON.stringify(SAMPLES[index].json, null, 2)
+  const sample = SAMPLES[index]
+  if (sample.json) return JSON.stringify(sample.json, null, 2)
+  return '// Loading...'
 }
 
 const LAYER_TYPES: Record<number, string> = {
@@ -73,10 +75,13 @@ const C = {
 const editorTextStyle = {
   'font-size': '0.8125rem',
   'line-height': '1.6',
-  padding: '1rem 1.25rem',
+  padding: '1rem 1.25rem 1rem 0',
   margin: '0',
   'tab-size': '2',
 } as const
+
+// Line number gutter width
+const GUTTER_WIDTH = '3.5rem'
 
 // ---------------------------------------------------------------------------
 // Line-only SVG icons (24x24 viewBox, stroke-width 1.5, no fill)
@@ -261,19 +266,95 @@ export default function App() {
   const [error, setError] = createSignal<string | null>(null)
   const [playing, setPlaying] = createSignal(false)
   const [tab, setTab] = createSignal<Tab>('parse')
-  const highlighted = createMemo(() => highlightJson(jsonInput()))
+  const [canvasSize, setCanvasSize] = createSignal<{ w: number; h: number }>({ w: 512, h: 512 })
+  const [leftWidth, setLeftWidth] = createSignal(35)
+
+  // Memoize line count and line number text to avoid recomputation on scroll
+  const lineCount = createMemo(() => {
+    const text = jsonInput()
+    let count = 1
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === '\n') count++
+    }
+    return count
+  })
+
+  const lineNumbers = createMemo(() => {
+    const n = lineCount()
+    const parts = new Array<string>(n)
+    for (let i = 0; i < n; i++) parts[i] = String(i + 1)
+    return parts.join('\n')
+  })
+
+  // Skip syntax highlighting for large files (>500 lines) to avoid DOM lag
+  const HIGHLIGHT_LINE_LIMIT = 500
+  const highlighted = createMemo(() => {
+    if (lineCount() > HIGHLIGHT_LINE_LIMIT) return null
+    return highlightJson(jsonInput())
+  })
 
   let canvasRef: HTMLCanvasElement | undefined
   let renderer: LottieRenderer | null = null
+  let splitRef: HTMLDivElement | undefined
+  let textareaRef: HTMLTextAreaElement | undefined
+
+  // Auto-size textarea to its content so the outer container scrolls
+  createEffect(() => {
+    jsonInput() // track dependency
+    if (textareaRef) {
+      textareaRef.style.height = 'auto'
+      textareaRef.style.height = `${textareaRef.scrollHeight}px`
+    }
+  })
+
+  function startDrag(e: MouseEvent) {
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = leftWidth()
+    const onMove = (ev: MouseEvent) => {
+      if (!splitRef) return
+      const parent = splitRef.parentElement
+      if (!parent) return
+      const totalW = parent.clientWidth
+      const delta = ev.clientX - startX
+      const pct = Math.max(20, Math.min(60, startW + (delta / totalW) * 100))
+      setLeftWidth(pct)
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }
 
   function selectSample(index: number) {
     setSampleIndex(index)
-    setJsonInput(formatSample(index))
     setResult(null)
     setError(null)
     if (renderer?.isPlaying()) {
       renderer.stop()
       setPlaying(false)
+    }
+
+    const sample = SAMPLES[index]
+    if (sample.url) {
+      setJsonInput('// Loading...')
+      fetch(sample.url)
+        .then((r) => r.text())
+        .then((text) => {
+          // Only set if we're still on the same sample
+          if (sampleIndex() === index) setJsonInput(text)
+        })
+        .catch(() => {
+          if (sampleIndex() === index) setJsonInput('// Failed to load fixture')
+        })
+    } else {
+      setJsonInput(formatSample(index))
     }
   }
 
@@ -321,6 +402,7 @@ export default function App() {
       return
     }
 
+    setCanvasSize({ w: renderer.width, h: renderer.height })
     renderer.play()
     setPlaying(true)
   }
@@ -386,6 +468,7 @@ export default function App() {
 
       {/* ---- Main split ---- */}
       <div
+        ref={(el) => (splitRef = el)}
         style={{
           display: 'flex',
           flex: '1',
@@ -395,11 +478,10 @@ export default function App() {
         {/* ======== Left panel: JSON editor ======== */}
         <div
           style={{
-            width: '45%',
-            'min-width': '320px',
+            width: `${leftWidth()}%`,
+            'min-width': '200px',
             display: 'flex',
             'flex-direction': 'column',
-            'border-right': `1px solid ${C.border}`,
             background: C.panelBg,
           }}
         >
@@ -432,49 +514,107 @@ export default function App() {
               <For each={SAMPLES}>{(sample, i) => <option value={i()}>{sample.name}</option>}</For>
             </select>
           </div>
-          {/* Overlay editor: highlighted <pre> behind transparent <textarea> */}
+          {/* Editor with line numbers — single scroll container */}
           <div
             style={{
               flex: '1',
-              position: 'relative',
               'min-height': '0',
               overflow: 'auto',
               background: C.inputBg,
+              position: 'relative',
             }}
           >
-            <pre
-              aria-hidden="true"
-              innerHTML={`${highlighted()}\n`}
-              style={{
-                ...editorTextStyle,
-                position: 'absolute',
-                inset: '0',
-                'pointer-events': 'none',
-                'white-space': 'pre',
-                'overflow-wrap': 'normal',
-              }}
-            />
-            <textarea
-              value={jsonInput()}
-              onInput={(e) => setJsonInput(e.currentTarget.value)}
-              spellcheck={false}
-              style={{
-                ...editorTextStyle,
-                position: 'relative',
-                width: '100%',
-                height: '100%',
-                color: 'transparent',
-                'caret-color': C.text,
-                background: 'transparent',
-                border: 'none',
-                outline: 'none',
-                resize: 'none',
-                'white-space': 'pre',
-                'overflow-wrap': 'normal',
-              }}
-            />
+            <div style={{ display: 'flex', 'min-height': '100%' }}>
+              {/* Line number gutter — sticky so it scrolls vertically but stays left */}
+              <pre
+                aria-hidden="true"
+                style={{
+                  width: GUTTER_WIDTH,
+                  'min-width': GUTTER_WIDTH,
+                  'flex-shrink': '0',
+                  'padding-top': '1rem',
+                  'padding-bottom': '1rem',
+                  'text-align': 'right',
+                  'font-size': '0.8125rem',
+                  'line-height': '1.6',
+                  color: '#2b3a5c',
+                  'user-select': 'none',
+                  'border-right': `1px solid ${C.borderLight}`,
+                  background: '#fdf8f0',
+                  'padding-right': '0.5rem',
+                  'box-sizing': 'border-box',
+                  margin: '0',
+                  position: 'sticky',
+                  left: '0',
+                  'z-index': '2',
+                }}
+              >
+                {lineNumbers()}
+              </pre>
+              {/* Code overlay area */}
+              <div
+                style={{
+                  flex: '1',
+                  position: 'relative',
+                  'min-width': '0',
+                }}
+              >
+                <Show when={highlighted()}>
+                  <pre
+                    aria-hidden="true"
+                    innerHTML={`${highlighted()}\n`}
+                    style={{
+                      ...editorTextStyle,
+                      'padding-left': '0.75rem',
+                      position: 'absolute',
+                      inset: '0',
+                      'pointer-events': 'none',
+                      'white-space': 'pre',
+                      'overflow-wrap': 'normal',
+                    }}
+                  />
+                </Show>
+                <textarea
+                  ref={(el) => (textareaRef = el)}
+                  value={jsonInput()}
+                  onInput={(e) => setJsonInput(e.currentTarget.value)}
+                  spellcheck={false}
+                  style={{
+                    ...editorTextStyle,
+                    'padding-left': '0.75rem',
+                    position: 'relative',
+                    width: '100%',
+                    'min-height': '100%',
+                    color: highlighted() ? 'transparent' : C.text,
+                    'caret-color': C.text,
+                    background: 'transparent',
+                    border: 'none',
+                    outline: 'none',
+                    resize: 'none',
+                    'white-space': 'pre',
+                    'overflow-wrap': 'normal',
+                    overflow: 'hidden',
+                  }}
+                />
+              </div>
+            </div>
           </div>
         </div>
+
+        {/* ======== Draggable divider ======== */}
+        {/* biome-ignore lint/a11y/noStaticElementInteractions: drag handle for split panel */}
+        <div
+          onMouseDown={startDrag}
+          style={{
+            width: '5px',
+            cursor: 'col-resize',
+            background: C.border,
+            'flex-shrink': '0',
+            transition: 'background 0.15s',
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = C.accent)}
+          onMouseLeave={(e) => (e.currentTarget.style.background = C.border)}
+        />
 
         {/* ======== Right panel: tabs + output ======== */}
         <div
@@ -685,11 +825,11 @@ export default function App() {
               >
                 <canvas
                   ref={setCanvasRef}
-                  width={512}
-                  height={512}
+                  width={canvasSize().w}
+                  height={canvasSize().h}
                   style={{
-                    'max-width': '100%',
-                    'max-height': '100%',
+                    width: '100%',
+                    height: '100%',
                     'object-fit': 'contain',
                     display: 'block',
                     'border-radius': '8px',

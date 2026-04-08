@@ -4,7 +4,9 @@
 export interface Sample {
   name: string
   description: string
-  json: object
+  json?: object
+  /** URL to fetch JSON from (for large fixture files). */
+  url?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -568,4 +570,42 @@ const solarSystem: Sample = {
 // Export ordered list
 // ---------------------------------------------------------------------------
 
-export const SAMPLES: Sample[] = [staticCircle, bouncingBall, pulsingRing, spinningSquares, colorMorph, solarSystem]
+// Fixture samples (loaded from test files via URL)
+const manyLayers: Sample = {
+  name: 'Many Layers (148K)',
+  description: '50 shape layers in a 10x5 grid with varied shapes, colors, rotations, and scale pulses',
+  url: '/fixtures/many_layers.json',
+}
+
+const manyKeyframes: Sample = {
+  name: 'Many Keyframes (247K)',
+  description: '8 layers: central pulsing sun + 7 orbiting bodies with 1100+ keyframes and bezier easing',
+  url: '/fixtures/many_keyframes.json',
+}
+
+const deepNesting: Sample = {
+  name: 'Deep Nesting (414K)',
+  description:
+    'Fractal garden: trees, clouds, fireflies, sun — 8 layers with 5-level nested groups and animated transforms',
+  url: '/fixtures/deep_nesting.json',
+}
+
+const kitchenSink: Sample = {
+  name: 'Kitchen Sink (282K)',
+  description:
+    'Clockwork Aquarium: fish schools, jellyfish, gear mechanisms, nautilus spiral, seahorse, treasure chest — 20 layers, all shape types, hold keyframes, bezier easing, parent refs',
+  url: '/fixtures/kitchen_sink.json',
+}
+
+export const SAMPLES: Sample[] = [
+  staticCircle,
+  bouncingBall,
+  pulsingRing,
+  spinningSquares,
+  colorMorph,
+  solarSystem,
+  manyLayers,
+  manyKeyframes,
+  deepNesting,
+  kitchenSink,
+]
