@@ -1139,6 +1139,473 @@ export fn lottie_result_len(ptr: [*]const u8) u32 {
 }
 
 // ---------------------------------------------------------------
+// Compiler — keyframe interpolation
+// ---------------------------------------------------------------
+
+/// Evaluate a cubic bezier easing curve at parameter `t` (0..1).
+///
+/// The curve is defined by control points (0,0), (x1,y1), (x2,y2), (1,1).
+/// This is the standard CSS cubic-bezier model used by Lottie.
+/// Returns the eased progress (y value) for the given linear progress `t`.
+pub fn cubicBezierEase(x1: f64, y1: f64, x2: f64, y2: f64, t: f64) f64 {
+    // Clamp input to [0, 1]
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+
+    // Newton-Raphson iteration to solve for the bezier parameter `s`
+    // such that bezierX(s) = t, then return bezierY(s).
+    // Bezier X(s) = 3*(1-s)^2*s*x1 + 3*(1-s)*s^2*x2 + s^3
+    // Bezier Y(s) = 3*(1-s)^2*s*y1 + 3*(1-s)*s^2*y2 + s^3
+
+    var s = t; // initial guess
+    const iterations = 8;
+    for (0..iterations) |_| {
+        const s2 = s * s;
+        const s3 = s2 * s;
+        const one_s = 1.0 - s;
+        const one_s2 = one_s * one_s;
+
+        // X(s)
+        const x = 3.0 * one_s2 * s * x1 + 3.0 * one_s * s2 * x2 + s3;
+        // X'(s) = derivative
+        const dx = 3.0 * one_s2 * x1 + 6.0 * one_s * s * (x2 - x1) + 3.0 * s2 * (1.0 - x2);
+
+        if (@abs(dx) < 1e-12) break;
+        s -= (x - t) / dx;
+        s = std.math.clamp(s, 0.0, 1.0);
+    }
+
+    // Evaluate Y(s)
+    const s2 = s * s;
+    const s3 = s2 * s;
+    const one_s = 1.0 - s;
+    const one_s2 = one_s * one_s;
+    return 3.0 * one_s2 * s * y1 + 3.0 * one_s * s2 * y2 + s3;
+}
+
+/// Linearly interpolate between two values.
+fn lerp(a: f64, b: f64, t: f64) f64 {
+    return a + (b - a) * t;
+}
+
+/// Resolve an AnimatedValue at a given frame time.
+/// Returns the interpolated scalar value.
+pub fn resolveValue(av: AnimatedValue, frame: f64) f64 {
+    switch (av) {
+        .static => |v| return v,
+        .keyframed => |kfs| {
+            if (kfs.len == 0) return 0;
+            if (kfs.len == 1) return kfs[0].value;
+
+            // Before first keyframe
+            if (frame <= kfs[0].time) return kfs[0].value;
+            // After last keyframe
+            if (frame >= kfs[kfs.len - 1].time) return kfs[kfs.len - 1].value;
+
+            // Find bracketing keyframes
+            for (kfs[0 .. kfs.len - 1], 0..) |kf, i| {
+                const next = kfs[i + 1];
+                if (frame >= kf.time and frame < next.time) {
+                    // Hold keyframe: no interpolation
+                    if (kf.hold) return kf.value;
+
+                    // Normalized linear progress
+                    const duration = next.time - kf.time;
+                    if (duration <= 0) return kf.value;
+                    const t = (frame - kf.time) / duration;
+
+                    // Apply easing if present
+                    const eased = if (kf.ease_out != null and next.ease_in != null)
+                        cubicBezierEase(
+                            kf.ease_out.?[0],
+                            kf.ease_out.?[1],
+                            next.ease_in.?[0],
+                            next.ease_in.?[1],
+                            t,
+                        )
+                    else
+                        t;
+
+                    return lerp(kf.value, next.value, eased);
+                }
+            }
+
+            return kfs[kfs.len - 1].value;
+        },
+    }
+}
+
+/// Resolve an AnimatedMulti at a given frame time.
+/// Returns a newly allocated slice of interpolated values.
+/// Caller owns the returned slice.
+pub fn resolveMulti(allocator: Allocator, am: AnimatedMulti, frame: f64) ![]f64 {
+    switch (am) {
+        .static => |vals| {
+            const result = try allocator.alloc(f64, vals.len);
+            @memcpy(result, vals);
+            return result;
+        },
+        .keyframed => |kfs| {
+            if (kfs.len == 0) return try allocator.alloc(f64, 0);
+
+            // Determine dimensionality from first keyframe
+            const dims = kfs[0].values.len;
+            const result = try allocator.alloc(f64, dims);
+
+            if (kfs.len == 1) {
+                for (0..dims) |d| {
+                    result[d] = if (d < kfs[0].values.len) kfs[0].values[d] else 0;
+                }
+                return result;
+            }
+
+            // Before first keyframe
+            if (frame <= kfs[0].time) {
+                for (0..dims) |d| {
+                    result[d] = if (d < kfs[0].values.len) kfs[0].values[d] else 0;
+                }
+                return result;
+            }
+
+            // After last keyframe
+            if (frame >= kfs[kfs.len - 1].time) {
+                const last = kfs[kfs.len - 1];
+                for (0..dims) |d| {
+                    result[d] = if (d < last.values.len) last.values[d] else 0;
+                }
+                return result;
+            }
+
+            // Find bracketing keyframes
+            for (kfs[0 .. kfs.len - 1], 0..) |kf, i| {
+                const next = kfs[i + 1];
+                if (frame >= kf.time and frame < next.time) {
+                    if (kf.hold) {
+                        for (0..dims) |d| {
+                            result[d] = if (d < kf.values.len) kf.values[d] else 0;
+                        }
+                        return result;
+                    }
+
+                    const duration = next.time - kf.time;
+                    if (duration <= 0) {
+                        for (0..dims) |d| {
+                            result[d] = if (d < kf.values.len) kf.values[d] else 0;
+                        }
+                        return result;
+                    }
+                    const t = (frame - kf.time) / duration;
+
+                    const eased = if (kf.ease_out != null and next.ease_in != null)
+                        cubicBezierEase(
+                            kf.ease_out.?[0],
+                            kf.ease_out.?[1],
+                            next.ease_in.?[0],
+                            next.ease_in.?[1],
+                            t,
+                        )
+                    else
+                        t;
+
+                    for (0..dims) |d| {
+                        const a = if (d < kf.values.len) kf.values[d] else 0;
+                        const b = if (d < next.values.len) next.values[d] else 0;
+                        result[d] = lerp(a, b, eased);
+                    }
+                    return result;
+                }
+            }
+
+            // Fallback: last keyframe
+            const last = kfs[kfs.len - 1];
+            for (0..dims) |d| {
+                result[d] = if (d < last.values.len) last.values[d] else 0;
+            }
+            return result;
+        },
+    }
+}
+
+/// A fully resolved transform at a specific frame — all values are concrete.
+pub const ResolvedTransform = struct {
+    anchor: [3]f64,
+    position: [3]f64,
+    scale: [3]f64,
+    rotation: f64,
+    opacity: f64,
+};
+
+/// Resolve a Transform to concrete values at a given frame time.
+/// Caller owns any intermediate allocations (uses stack for small arrays).
+pub fn resolveTransform(allocator: Allocator, tr: Transform, frame: f64) !ResolvedTransform {
+    var result = ResolvedTransform{
+        .anchor = .{ 0, 0, 0 },
+        .position = .{ 0, 0, 0 },
+        .scale = .{ 100, 100, 100 },
+        .rotation = 0,
+        .opacity = 100,
+    };
+
+    if (tr.anchor) |a| {
+        const vals = try resolveMulti(allocator, a, frame);
+        defer allocator.free(vals);
+        for (0..@min(3, vals.len)) |i| result.anchor[i] = vals[i];
+    }
+
+    if (tr.position) |p| {
+        const vals = try resolveMulti(allocator, p, frame);
+        defer allocator.free(vals);
+        for (0..@min(3, vals.len)) |i| result.position[i] = vals[i];
+    }
+
+    if (tr.scale) |s| {
+        const vals = try resolveMulti(allocator, s, frame);
+        defer allocator.free(vals);
+        for (0..@min(3, vals.len)) |i| result.scale[i] = vals[i];
+    }
+
+    if (tr.rotation) |r| {
+        result.rotation = resolveValue(r, frame);
+    }
+
+    if (tr.opacity) |o| {
+        result.opacity = resolveValue(o, frame);
+    }
+
+    return result;
+}
+
+/// A resolved shape at a specific frame — animated properties are concrete.
+pub const ResolvedShape = struct {
+    ty: ShapeType,
+    name: ?[]const u8,
+    /// Resolved sub-shapes (for groups).
+    items: []const ResolvedShape,
+    /// Rectangle/ellipse size [w, h].
+    size: ?[2]f64,
+    /// Rectangle/ellipse position [x, y].
+    position: ?[2]f64,
+    /// Rectangle corner roundness.
+    roundness: ?f64,
+    /// Fill/stroke color [r, g, b] or [r, g, b, a].
+    color: ?[4]f64,
+    /// Fill/stroke opacity (0-100).
+    opacity: ?f64,
+    /// Stroke width.
+    stroke_width: ?f64,
+    /// Shape-level transform.
+    transform: ?ResolvedTransform,
+};
+
+/// Resolve a Shape to concrete values at a given frame.
+/// Caller owns the returned ResolvedShape and must call freeResolvedShapes.
+pub fn resolveShape(allocator: Allocator, shape: Shape, frame: f64) !ResolvedShape {
+    // Resolve sub-items (for groups)
+    var items = std.ArrayList(ResolvedShape).empty;
+    errdefer freeResolvedShapes(allocator, items.items);
+    for (shape.items) |child| {
+        const resolved = try resolveShape(allocator, child, frame);
+        items.append(allocator, resolved) catch return error.OutOfMemory;
+    }
+    const owned_items = items.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    errdefer {
+        freeResolvedShapes(allocator, owned_items);
+    }
+
+    // Resolve animated properties
+    const size: ?[2]f64 = if (shape.size) |s| blk: {
+        const vals = try resolveMulti(allocator, s, frame);
+        defer allocator.free(vals);
+        break :blk .{ if (vals.len > 0) vals[0] else 0, if (vals.len > 1) vals[1] else 0 };
+    } else null;
+
+    const position: ?[2]f64 = if (shape.position) |p| blk: {
+        const vals = try resolveMulti(allocator, p, frame);
+        defer allocator.free(vals);
+        break :blk .{ if (vals.len > 0) vals[0] else 0, if (vals.len > 1) vals[1] else 0 };
+    } else null;
+
+    const roundness: ?f64 = if (shape.roundness) |r| resolveValue(r, frame) else null;
+
+    const color: ?[4]f64 = if (shape.color) |c| blk: {
+        const vals = try resolveMulti(allocator, c, frame);
+        defer allocator.free(vals);
+        break :blk .{
+            if (vals.len > 0) vals[0] else 0,
+            if (vals.len > 1) vals[1] else 0,
+            if (vals.len > 2) vals[2] else 0,
+            if (vals.len > 3) vals[3] else 1,
+        };
+    } else null;
+
+    const opacity: ?f64 = if (shape.opacity) |o| resolveValue(o, frame) else null;
+    const stroke_width: ?f64 = if (shape.stroke_width) |w| resolveValue(w, frame) else null;
+
+    const transform: ?ResolvedTransform = if (shape.transform) |t|
+        try resolveTransform(allocator, t, frame)
+    else
+        null;
+
+    return ResolvedShape{
+        .ty = shape.ty,
+        .name = shape.name,
+        .items = owned_items,
+        .size = size,
+        .position = position,
+        .roundness = roundness,
+        .color = color,
+        .opacity = opacity,
+        .stroke_width = stroke_width,
+        .transform = transform,
+    };
+}
+
+/// A single resolved layer at a specific frame.
+pub const ResolvedLayer = struct {
+    ty: LayerType,
+    name: ?[]const u8,
+    index: ?i64,
+    parent: ?i64,
+    in_point: f64,
+    out_point: f64,
+    transform: ?ResolvedTransform,
+    shapes: []const ResolvedShape,
+    /// Whether this layer is visible at this frame (in_point <= frame < out_point).
+    visible: bool,
+};
+
+/// A compiled frame: the full animation state at a specific frame time.
+pub const CompiledFrame = struct {
+    allocator: Allocator,
+    frame: f64,
+    layers: []const ResolvedLayer,
+
+    pub fn deinit(self: *const CompiledFrame) void {
+        for (self.layers) |layer| {
+            freeResolvedShapes(self.allocator, layer.shapes);
+        }
+        self.allocator.free(self.layers);
+    }
+};
+
+/// Compile (resolve) an animation at a single frame time.
+/// Returns a CompiledFrame with all animated values resolved.
+/// Caller owns the returned CompiledFrame and must call deinit().
+pub fn compileFrame(allocator: Allocator, anim: *const Animation, frame: f64) !CompiledFrame {
+    var layers = std.ArrayList(ResolvedLayer).empty;
+    errdefer {
+        for (layers.items) |layer| {
+            freeResolvedShapes(allocator, layer.shapes);
+        }
+        layers.deinit(allocator);
+    }
+
+    for (anim.layers) |layer| {
+        const visible = frame >= layer.in_point and frame < layer.out_point;
+
+        const transform: ?ResolvedTransform = if (layer.transform) |t|
+            try resolveTransform(allocator, t, frame)
+        else
+            null;
+
+        // Resolve shapes
+        var resolved_shapes = std.ArrayList(ResolvedShape).empty;
+        errdefer freeResolvedShapes(allocator, resolved_shapes.items);
+
+        if (visible) {
+            for (layer.shapes) |shape| {
+                const rs = try resolveShape(allocator, shape, frame);
+                resolved_shapes.append(allocator, rs) catch return error.OutOfMemory;
+            }
+        }
+        const owned_shapes = resolved_shapes.toOwnedSlice(allocator) catch return error.OutOfMemory;
+        errdefer freeResolvedShapes(allocator, owned_shapes);
+
+        layers.append(allocator, .{
+            .ty = layer.ty,
+            .name = layer.name,
+            .index = layer.index,
+            .parent = layer.parent,
+            .in_point = layer.in_point,
+            .out_point = layer.out_point,
+            .transform = transform,
+            .shapes = owned_shapes,
+            .visible = visible,
+        }) catch return error.OutOfMemory;
+    }
+
+    return CompiledFrame{
+        .allocator = allocator,
+        .frame = frame,
+        .layers = layers.toOwnedSlice(allocator) catch return error.OutOfMemory,
+    };
+}
+
+/// A compiled animation: all frames resolved for the full timeline.
+pub const CompiledAnimation = struct {
+    allocator: Allocator,
+    frame_rate: f64,
+    width: u32,
+    height: u32,
+    frames: []const CompiledFrame,
+
+    pub fn deinit(self: *const CompiledAnimation) void {
+        for (self.frames) |*frame| {
+            frame.deinit();
+        }
+        self.allocator.free(self.frames);
+    }
+};
+
+/// Compile an entire animation: resolve every integer frame from in_point to out_point.
+/// Returns a CompiledAnimation with all frames resolved.
+/// Caller owns the result and must call deinit().
+pub fn compile(allocator: Allocator, anim: *const Animation) !CompiledAnimation {
+    const start: i64 = @intFromFloat(@floor(anim.in_point));
+    const end: i64 = @intFromFloat(@ceil(anim.out_point));
+    const frame_count: usize = if (end > start) @intCast(end - start) else 0;
+
+    var frames = try allocator.alloc(CompiledFrame, frame_count);
+    errdefer {
+        // Free any frames we've already compiled
+        for (frames) |*f| {
+            if (f.layers.len > 0) f.deinit();
+        }
+        allocator.free(frames);
+    }
+
+    // Initialize all frames to empty so errdefer works
+    for (frames) |*f| {
+        f.* = CompiledFrame{
+            .allocator = allocator,
+            .frame = 0,
+            .layers = &.{},
+        };
+    }
+
+    for (0..frame_count) |i| {
+        const frame_time: f64 = @floatFromInt(start + @as(i64, @intCast(i)));
+        frames[i] = try compileFrame(allocator, anim, frame_time);
+    }
+
+    return CompiledAnimation{
+        .allocator = allocator,
+        .frame_rate = anim.frame_rate,
+        .width = anim.width,
+        .height = anim.height,
+        .frames = frames,
+    };
+}
+
+/// Free a slice of ResolvedShapes (recursive).
+fn freeResolvedShapes(allocator: Allocator, shapes: []const ResolvedShape) void {
+    for (shapes) |shape| {
+        freeResolvedShapes(allocator, shape.items);
+    }
+    allocator.free(shapes);
+}
+
+// ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
 
@@ -2014,4 +2481,484 @@ test "validate: valid fixtures have no errors" {
 
         try testing.expectEqual(@as(usize, 0), countErrors(issues));
     }
+}
+
+// ---------------------------------------------------------------
+// Compiler tests — cubic bezier easing
+// ---------------------------------------------------------------
+
+test "cubicBezierEase: linear (0,0,1,1) returns t" {
+    try testing.expectApproxEqAbs(@as(f64, 0.0), cubicBezierEase(0, 0, 1, 1, 0.0), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0.25), cubicBezierEase(0, 0, 1, 1, 0.25), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), cubicBezierEase(0, 0, 1, 1, 0.5), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0.75), cubicBezierEase(0, 0, 1, 1, 0.75), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 1.0), cubicBezierEase(0, 0, 1, 1, 1.0), 0.001);
+}
+
+test "cubicBezierEase: ease-in-out (0.42,0,0.58,1) is symmetric around 0.5" {
+    const mid = cubicBezierEase(0.42, 0, 0.58, 1, 0.5);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), mid, 0.01);
+
+    // Ease-in-out: slow start, so at t=0.25 y should be < 0.25
+    const q1 = cubicBezierEase(0.42, 0, 0.58, 1, 0.25);
+    try testing.expect(q1 < 0.25);
+
+    // Ease-in-out: fast middle, so at t=0.75 y should be > 0.75
+    const q3 = cubicBezierEase(0.42, 0, 0.58, 1, 0.75);
+    try testing.expect(q3 > 0.75);
+}
+
+test "cubicBezierEase: ease (0.25,0.1,0.25,1) CSS standard" {
+    // Known CSS ease: starts slow, ends gentle
+    const at_half = cubicBezierEase(0.25, 0.1, 0.25, 1, 0.5);
+    try testing.expect(at_half > 0.5); // ease overshoots linear at midpoint
+}
+
+test "cubicBezierEase: clamps at boundaries" {
+    try testing.expectEqual(@as(f64, 0.0), cubicBezierEase(0.42, 0, 0.58, 1, -1.0));
+    try testing.expectEqual(@as(f64, 1.0), cubicBezierEase(0.42, 0, 0.58, 1, 2.0));
+}
+
+// ---------------------------------------------------------------
+// Compiler tests — resolveValue (scalar)
+// ---------------------------------------------------------------
+
+test "resolveValue: static returns constant" {
+    const av = AnimatedValue{ .static = 42.0 };
+    try testing.expectEqual(@as(f64, 42.0), resolveValue(av, 0));
+    try testing.expectEqual(@as(f64, 42.0), resolveValue(av, 100));
+}
+
+test "resolveValue: single keyframe returns that value" {
+    const kfs = [_]Keyframe{.{ .time = 0, .value = 75, .ease_out = null, .ease_in = null, .hold = false }};
+    const av = AnimatedValue{ .keyframed = &kfs };
+    try testing.expectEqual(@as(f64, 75.0), resolveValue(av, -10));
+    try testing.expectEqual(@as(f64, 75.0), resolveValue(av, 0));
+    try testing.expectEqual(@as(f64, 75.0), resolveValue(av, 100));
+}
+
+test "resolveValue: linear interpolation between two keyframes" {
+    const kfs = [_]Keyframe{
+        .{ .time = 0, .value = 0, .ease_out = null, .ease_in = null, .hold = false },
+        .{ .time = 60, .value = 100, .ease_out = null, .ease_in = null, .hold = false },
+    };
+    const av = AnimatedValue{ .keyframed = &kfs };
+
+    try testing.expectApproxEqAbs(@as(f64, 0.0), resolveValue(av, 0), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 50.0), resolveValue(av, 30), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 100.0), resolveValue(av, 60), 0.001);
+}
+
+test "resolveValue: clamps before first and after last keyframe" {
+    const kfs = [_]Keyframe{
+        .{ .time = 10, .value = 20, .ease_out = null, .ease_in = null, .hold = false },
+        .{ .time = 50, .value = 80, .ease_out = null, .ease_in = null, .hold = false },
+    };
+    const av = AnimatedValue{ .keyframed = &kfs };
+
+    try testing.expectEqual(@as(f64, 20.0), resolveValue(av, 0));
+    try testing.expectEqual(@as(f64, 80.0), resolveValue(av, 100));
+}
+
+test "resolveValue: hold keyframe returns left value" {
+    const kfs = [_]Keyframe{
+        .{ .time = 0, .value = 100, .ease_out = null, .ease_in = null, .hold = true },
+        .{ .time = 30, .value = 0, .ease_out = null, .ease_in = null, .hold = false },
+    };
+    const av = AnimatedValue{ .keyframed = &kfs };
+
+    try testing.expectEqual(@as(f64, 100.0), resolveValue(av, 0));
+    try testing.expectEqual(@as(f64, 100.0), resolveValue(av, 15));
+    try testing.expectEqual(@as(f64, 100.0), resolveValue(av, 29));
+}
+
+test "resolveValue: eased interpolation" {
+    const kfs = [_]Keyframe{
+        .{ .time = 0, .value = 0, .ease_out = Vec2{ 0.42, 0 }, .ease_in = null, .hold = false },
+        .{ .time = 60, .value = 100, .ease_out = null, .ease_in = Vec2{ 0.58, 1 }, .hold = false },
+    };
+    const av = AnimatedValue{ .keyframed = &kfs };
+
+    const at_half = resolveValue(av, 30);
+    // With ease-in-out, at t=0.5 value should be ~50 (symmetric curve)
+    try testing.expectApproxEqAbs(@as(f64, 50.0), at_half, 2.0);
+}
+
+test "resolveValue: multiple segments" {
+    const kfs = [_]Keyframe{
+        .{ .time = 0, .value = 0, .ease_out = null, .ease_in = null, .hold = false },
+        .{ .time = 30, .value = 100, .ease_out = null, .ease_in = null, .hold = false },
+        .{ .time = 60, .value = 50, .ease_out = null, .ease_in = null, .hold = false },
+    };
+    const av = AnimatedValue{ .keyframed = &kfs };
+
+    try testing.expectApproxEqAbs(@as(f64, 50.0), resolveValue(av, 15), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 100.0), resolveValue(av, 30), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 75.0), resolveValue(av, 45), 0.001);
+}
+
+// ---------------------------------------------------------------
+// Compiler tests — resolveMulti (multi-dimensional)
+// ---------------------------------------------------------------
+
+test "resolveMulti: static returns copy of values" {
+    const static_vals = [_]f64{ 100, 200, 0 };
+    const am = AnimatedMulti{ .static = &static_vals };
+
+    const result = try resolveMulti(testing.allocator, am, 0);
+    defer testing.allocator.free(result);
+
+    try testing.expectEqual(@as(usize, 3), result.len);
+    try testing.expectEqual(@as(f64, 100.0), result[0]);
+    try testing.expectEqual(@as(f64, 200.0), result[1]);
+}
+
+test "resolveMulti: linear interpolation between two keyframes" {
+    const vals0 = [_]f64{ 0, 0 };
+    const vals1 = [_]f64{ 100, 200 };
+    const kfs = [_]MultiKeyframe{
+        .{ .time = 0, .values = &vals0, .ease_out = null, .ease_in = null, .hold = false },
+        .{ .time = 60, .values = &vals1, .ease_out = null, .ease_in = null, .hold = false },
+    };
+    const am = AnimatedMulti{ .keyframed = &kfs };
+
+    const result = try resolveMulti(testing.allocator, am, 30);
+    defer testing.allocator.free(result);
+
+    try testing.expectApproxEqAbs(@as(f64, 50.0), result[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 100.0), result[1], 0.001);
+}
+
+test "resolveMulti: hold keyframe" {
+    const vals0 = [_]f64{ 10, 20 };
+    const vals1 = [_]f64{ 90, 80 };
+    const kfs = [_]MultiKeyframe{
+        .{ .time = 0, .values = &vals0, .ease_out = null, .ease_in = null, .hold = true },
+        .{ .time = 60, .values = &vals1, .ease_out = null, .ease_in = null, .hold = false },
+    };
+    const am = AnimatedMulti{ .keyframed = &kfs };
+
+    const result = try resolveMulti(testing.allocator, am, 30);
+    defer testing.allocator.free(result);
+
+    try testing.expectEqual(@as(f64, 10.0), result[0]);
+    try testing.expectEqual(@as(f64, 20.0), result[1]);
+}
+
+// ---------------------------------------------------------------
+// Compiler tests — resolveTransform
+// ---------------------------------------------------------------
+
+test "resolveTransform: static transform returns expected values" {
+    const anchor_vals = [_]f64{ 50, 50, 0 };
+    const pos_vals = [_]f64{ 100, 200, 0 };
+    const scale_vals = [_]f64{ 50, 75, 100 };
+
+    const tr = Transform{
+        .anchor = AnimatedMulti{ .static = &anchor_vals },
+        .position = AnimatedMulti{ .static = &pos_vals },
+        .scale = AnimatedMulti{ .static = &scale_vals },
+        .rotation = AnimatedValue{ .static = 45.0 },
+        .opacity = AnimatedValue{ .static = 80.0 },
+    };
+
+    const resolved = try resolveTransform(testing.allocator, tr, 0);
+    try testing.expectEqual(@as(f64, 50.0), resolved.anchor[0]);
+    try testing.expectEqual(@as(f64, 50.0), resolved.anchor[1]);
+    try testing.expectEqual(@as(f64, 100.0), resolved.position[0]);
+    try testing.expectEqual(@as(f64, 200.0), resolved.position[1]);
+    try testing.expectEqual(@as(f64, 50.0), resolved.scale[0]);
+    try testing.expectEqual(@as(f64, 75.0), resolved.scale[1]);
+    try testing.expectEqual(@as(f64, 45.0), resolved.rotation);
+    try testing.expectEqual(@as(f64, 80.0), resolved.opacity);
+}
+
+test "resolveTransform: null fields use defaults" {
+    const tr = Transform{
+        .anchor = null,
+        .position = null,
+        .scale = null,
+        .rotation = null,
+        .opacity = null,
+    };
+
+    const resolved = try resolveTransform(testing.allocator, tr, 0);
+    try testing.expectEqual(@as(f64, 0.0), resolved.anchor[0]);
+    try testing.expectEqual(@as(f64, 0.0), resolved.position[0]);
+    try testing.expectEqual(@as(f64, 100.0), resolved.scale[0]);
+    try testing.expectEqual(@as(f64, 0.0), resolved.rotation);
+    try testing.expectEqual(@as(f64, 100.0), resolved.opacity);
+}
+
+// ---------------------------------------------------------------
+// Compiler tests — compileFrame
+// ---------------------------------------------------------------
+
+test "compileFrame: minimal animation" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":100,"h":100,"layers":[
+        \\  {"ty":4,"ip":0,"op":60,"ks":{
+        \\    "o":{"a":0,"k":100},
+        \\    "p":{"a":0,"k":[50,50,0]}
+        \\  }}
+        \\]}
+    ;
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    const frame = try compileFrame(testing.allocator, &anim, 0);
+    defer frame.deinit();
+
+    try testing.expectEqual(@as(f64, 0.0), frame.frame);
+    try testing.expectEqual(@as(usize, 1), frame.layers.len);
+    try testing.expect(frame.layers[0].visible);
+    try testing.expect(frame.layers[0].transform != null);
+    try testing.expectEqual(@as(f64, 100.0), frame.layers[0].transform.?.opacity);
+    try testing.expectEqual(@as(f64, 50.0), frame.layers[0].transform.?.position[0]);
+}
+
+test "compileFrame: layer visibility based on timing" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":100,"h":100,"layers":[
+        \\  {"ty":4,"ip":10,"op":50}
+        \\]}
+    ;
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    // Before layer starts
+    const f0 = try compileFrame(testing.allocator, &anim, 5);
+    defer f0.deinit();
+    try testing.expect(!f0.layers[0].visible);
+
+    // During layer
+    const f1 = try compileFrame(testing.allocator, &anim, 25);
+    defer f1.deinit();
+    try testing.expect(f1.layers[0].visible);
+
+    // After layer ends
+    const f2 = try compileFrame(testing.allocator, &anim, 55);
+    defer f2.deinit();
+    try testing.expect(!f2.layers[0].visible);
+}
+
+test "compileFrame: animated opacity resolves at frame" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":100,"h":100,"layers":[
+        \\  {"ty":4,"ip":0,"op":60,"ks":{
+        \\    "o":{"a":1,"k":[
+        \\      {"t":0,"s":[100]},
+        \\      {"t":60,"s":[0]}
+        \\    ]}
+        \\  }}
+        \\]}
+    ;
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    const f30 = try compileFrame(testing.allocator, &anim, 30);
+    defer f30.deinit();
+
+    try testing.expectApproxEqAbs(@as(f64, 50.0), f30.layers[0].transform.?.opacity, 0.1);
+}
+
+test "compileFrame: shape properties resolved" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":100,"h":100,"layers":[
+        \\  {"ty":4,"ip":0,"op":60,"shapes":[
+        \\    {"ty":"rc","s":{"a":0,"k":[200,100]},"p":{"a":0,"k":[50,50]},"r":{"a":0,"k":10}},
+        \\    {"ty":"fl","c":{"a":0,"k":[1,0,0,1]},"o":{"a":0,"k":80}}
+        \\  ]}
+        \\]}
+    ;
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    const frame = try compileFrame(testing.allocator, &anim, 0);
+    defer frame.deinit();
+
+    try testing.expectEqual(@as(usize, 2), frame.layers[0].shapes.len);
+
+    // Rectangle
+    const rect = frame.layers[0].shapes[0];
+    try testing.expectEqual(ShapeType.rectangle, rect.ty);
+    try testing.expect(rect.size != null);
+    try testing.expectEqual(@as(f64, 200.0), rect.size.?[0]);
+    try testing.expectEqual(@as(f64, 100.0), rect.size.?[1]);
+    try testing.expectEqual(@as(f64, 10.0), rect.roundness.?);
+
+    // Fill
+    const fill = frame.layers[0].shapes[1];
+    try testing.expectEqual(ShapeType.fill, fill.ty);
+    try testing.expectEqual(@as(f64, 1.0), fill.color.?[0]);
+    try testing.expectEqual(@as(f64, 0.0), fill.color.?[1]);
+    try testing.expectEqual(@as(f64, 80.0), fill.opacity.?);
+}
+
+// ---------------------------------------------------------------
+// Compiler tests — compile (full animation)
+// ---------------------------------------------------------------
+
+test "compile: produces correct number of frames" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":100,"h":100,"layers":[]}
+    ;
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    const compiled = try compile(testing.allocator, &anim);
+    defer compiled.deinit();
+
+    try testing.expectEqual(@as(usize, 60), compiled.frames.len);
+    try testing.expectEqual(@as(f64, 30.0), compiled.frame_rate);
+    try testing.expectEqual(@as(u32, 100), compiled.width);
+    try testing.expectEqual(@as(u32, 100), compiled.height);
+}
+
+test "compile: frame times are sequential" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":10,"w":100,"h":100,"layers":[]}
+    ;
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    const compiled = try compile(testing.allocator, &anim);
+    defer compiled.deinit();
+
+    for (compiled.frames, 0..) |frame, i| {
+        try testing.expectEqual(@as(f64, @floatFromInt(i)), frame.frame);
+    }
+}
+
+test "compile: animated values change across frames" {
+    const json =
+        \\{"v":"5.7.1","fr":30,"ip":0,"op":60,"w":100,"h":100,"layers":[
+        \\  {"ty":4,"ip":0,"op":60,"ks":{
+        \\    "o":{"a":1,"k":[
+        \\      {"t":0,"s":[100]},
+        \\      {"t":60,"s":[0]}
+        \\    ]}
+        \\  }}
+        \\]}
+    ;
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    const compiled = try compile(testing.allocator, &anim);
+    defer compiled.deinit();
+
+    // Opacity should decrease from 100 to 0 over 60 frames
+    const opacity_0 = compiled.frames[0].layers[0].transform.?.opacity;
+    const opacity_30 = compiled.frames[30].layers[0].transform.?.opacity;
+    const opacity_59 = compiled.frames[59].layers[0].transform.?.opacity;
+
+    try testing.expectApproxEqAbs(@as(f64, 100.0), opacity_0, 0.1);
+    try testing.expectApproxEqAbs(@as(f64, 50.0), opacity_30, 0.1);
+    try testing.expect(opacity_59 < 5.0);
+}
+
+// ---------------------------------------------------------------
+// Compiler integration tests — fixtures
+// ---------------------------------------------------------------
+
+test "compile fixture: many_layers.json" {
+    const json = try readFixture("test/fixtures/many_layers.json");
+    defer testing.allocator.free(json);
+
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    // Compile just a few sample frames to test, not the whole animation
+    const f0 = try compileFrame(testing.allocator, &anim, 0);
+    defer f0.deinit();
+    try testing.expectEqual(@as(usize, 50), f0.layers.len);
+
+    const f90 = try compileFrame(testing.allocator, &anim, 90);
+    defer f90.deinit();
+    try testing.expectEqual(@as(usize, 50), f90.layers.len);
+
+    // Verify transforms are resolved (not null) for all visible layers
+    for (f0.layers) |layer| {
+        if (layer.visible) {
+            try testing.expect(layer.transform != null);
+        }
+    }
+}
+
+test "compile fixture: many_keyframes.json" {
+    const json = try readFixture("test/fixtures/many_keyframes.json");
+    defer testing.allocator.free(json);
+
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    // Sample frames at start, middle, end
+    const f0 = try compileFrame(testing.allocator, &anim, 0);
+    defer f0.deinit();
+
+    const f120 = try compileFrame(testing.allocator, &anim, 120);
+    defer f120.deinit();
+
+    const f239 = try compileFrame(testing.allocator, &anim, 239);
+    defer f239.deinit();
+
+    // All layers should have resolved transforms at all frames
+    for (f120.layers) |layer| {
+        if (layer.visible) {
+            try testing.expect(layer.transform != null);
+        }
+    }
+
+    // Orbiter positions should differ between frames (they animate)
+    if (f0.layers.len > 1 and f120.layers.len > 1) {
+        const pos0 = f0.layers[1].transform.?.position;
+        const pos120 = f120.layers[1].transform.?.position;
+        // At least one coordinate should differ
+        try testing.expect(pos0[0] != pos120[0] or pos0[1] != pos120[1]);
+    }
+}
+
+test "compile fixture: deep_nesting.json" {
+    const json = try readFixture("test/fixtures/deep_nesting.json");
+    defer testing.allocator.free(json);
+
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    const f0 = try compileFrame(testing.allocator, &anim, 0);
+    defer f0.deinit();
+
+    const f75 = try compileFrame(testing.allocator, &anim, 75);
+    defer f75.deinit();
+
+    // Verify nested shapes are resolved
+    for (f0.layers) |layer| {
+        if (layer.shapes.len > 0) {
+            const group = layer.shapes[0];
+            try testing.expect(group.items.len > 0);
+        }
+    }
+}
+
+test "compile fixture: kitchen_sink.json" {
+    const json = try readFixture("test/fixtures/kitchen_sink.json");
+    defer testing.allocator.free(json);
+
+    const anim = try parse(testing.allocator, json);
+    defer anim.deinit();
+
+    const f0 = try compileFrame(testing.allocator, &anim, 0);
+    defer f0.deinit();
+
+    const f150 = try compileFrame(testing.allocator, &anim, 150);
+    defer f150.deinit();
+
+    try testing.expectEqual(@as(usize, 20), f0.layers.len);
+
+    // Verify mix of visible/non-visible layers at frame 0
+    var visible_count: usize = 0;
+    for (f0.layers) |layer| {
+        if (layer.visible) visible_count += 1;
+    }
+    try testing.expect(visible_count > 0);
 }
