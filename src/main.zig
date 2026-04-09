@@ -302,7 +302,7 @@ fn renderFile(
     const anim = loadAndParse(allocator, path, stderr);
     defer anim.deinit();
 
-    // Flush stdout buffer before terminal.render takes over raw output
+    // Flush any prior buffered output before rendering.
     stdout.flush() catch {};
 
     terminal.render(allocator, &anim, config, stdout) catch |err| {
@@ -310,6 +310,8 @@ fn renderFile(
         stderr.flush() catch {};
         std.process.exit(1);
     };
+    // Flush immediately so the image reaches the terminal.
+    stdout.flush() catch {};
 }
 
 fn parseHexColor(hex: []const u8) ?@import("rasterizer").Pixel {

@@ -306,6 +306,7 @@ fn pointInConvexQuad(px: f64, py: f64, corners: [4][2]f64) bool {
 /// The `canvas_mat` is prepended to every layer transform (typically a scale
 /// matrix that maps animation coordinates to output pixel coordinates).
 /// Layer opacity is applied to all shapes in the layer.
+/// Parent-child layer relationships are resolved by walking the parent chain.
 pub fn renderFrame(buf: *PixelBuffer, frame: *const lottie.CompiledFrame, canvas_mat: Matrix) void {
     // Render layers in reverse order (bottom layer first in Lottie spec).
     var li: usize = frame.layers.len;
@@ -314,15 +315,56 @@ pub fn renderFrame(buf: *PixelBuffer, frame: *const lottie.CompiledFrame, canvas
         const layer = &frame.layers[li];
         if (!layer.visible) continue;
 
-        const layer_mat = if (layer.transform) |tr|
-            canvas_mat.multiply(matrixFromTransform(tr))
-        else
-            canvas_mat;
+        // Build world transform by walking the parent chain.
+        const world = resolveLayerWorldTransform(frame.layers, layer, canvas_mat);
 
-        const layer_opacity: f64 = if (layer.transform) |tr| tr.opacity / 100.0 else 1.0;
-
-        renderShapes(buf, layer.shapes, layer_mat, layer_opacity);
+        renderShapes(buf, layer.shapes, world.mat, world.opacity);
     }
+}
+
+const WorldTransform = struct {
+    mat: Matrix,
+    opacity: f64,
+};
+
+/// Walk the parent chain to compose the full world transform for a layer.
+/// Applies transforms in order: canvas -> ... -> grandparent -> parent -> self.
+fn resolveLayerWorldTransform(layers: []const lottie.ResolvedLayer, layer: *const lottie.ResolvedLayer, canvas_mat: Matrix) WorldTransform {
+    // Collect the chain from self up to root (max 32 deep to prevent cycles).
+    var chain: [32]*const lottie.ResolvedLayer = undefined;
+    var depth: usize = 0;
+    var current: ?*const lottie.ResolvedLayer = layer;
+
+    while (current) |cur| {
+        if (depth >= 32) break; // guard against cycles
+        chain[depth] = cur;
+        depth += 1;
+        current = if (cur.parent) |pid| findLayerByIndex(layers, pid) else null;
+    }
+
+    // Apply transforms from root (last in chain) down to self (first).
+    var mat = canvas_mat;
+    var opacity: f64 = 1.0;
+    var i: usize = depth;
+    while (i > 0) {
+        i -= 1;
+        if (chain[i].transform) |tr| {
+            mat = mat.multiply(matrixFromTransform(tr));
+            opacity *= tr.opacity / 100.0;
+        }
+    }
+
+    return .{ .mat = mat, .opacity = opacity };
+}
+
+/// Find a layer by its index field.
+fn findLayerByIndex(layers: []const lottie.ResolvedLayer, index: i64) ?*const lottie.ResolvedLayer {
+    for (layers) |*l| {
+        if (l.index) |idx| {
+            if (idx == index) return l;
+        }
+    }
+    return null;
 }
 
 /// Render a slice of resolved shapes.

@@ -43,6 +43,13 @@ tasks:
     cmds:
       - rm -rf .zig-cache zig-out
 
+  render:
+    desc: Render a Lottie animation in the terminal (Kitty graphics)
+    vars:
+      FILE: '{{.CLI_ARGS | default "test/fixtures/kitchen_sink.json"}}'
+    cmds:
+      - zig build run -- render {{.FILE}}
+
   version:
     desc: Show current version
     silent: true
