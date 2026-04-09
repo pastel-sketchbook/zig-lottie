@@ -3,6 +3,53 @@ const lottie = @import("zig-lottie");
 const rasterizer = @import("rasterizer");
 const kitty = @import("kitty");
 const Allocator = std.mem.Allocator;
+const posix = std.posix;
+
+// ---------------------------------------------------------------
+// Terminal Size Detection
+// ---------------------------------------------------------------
+
+/// Terminal pixel dimensions as reported by the terminal emulator.
+pub const TerminalPixelSize = struct {
+    width: u32,
+    height: u32,
+};
+
+/// Query the terminal's pixel dimensions via TIOCGWINSZ ioctl.
+/// Returns null if the ioctl fails (e.g. stdout is piped, not a tty,
+/// or the terminal does not report pixel dimensions).
+pub fn getTerminalPixelSize(fd: posix.fd_t) ?TerminalPixelSize {
+    var wsz: posix.winsize = .{
+        .row = 0,
+        .col = 0,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+
+    const err = posix.system.ioctl(fd, posix.T.IOCGWINSZ, @intFromPtr(&wsz));
+    if (posix.errno(err) != .SUCCESS) return null;
+
+    // Some terminals report 0 for pixel dimensions even on success
+    if (wsz.xpixel == 0 or wsz.ypixel == 0) return null;
+
+    return .{
+        .width = @as(u32, wsz.xpixel),
+        .height = @as(u32, wsz.ypixel),
+    };
+}
+
+/// Determine the default output width for rendering.
+/// Priority: 1) explicit config width, 2) terminal pixel width, 3) fallback cap of 800.
+fn defaultOutputWidth(anim_width: u32, config_width: ?u32) u32 {
+    if (config_width) |w| return w;
+
+    // Try to detect terminal pixel width from stdout
+    if (getTerminalPixelSize(std.posix.STDOUT_FILENO)) |term_size| {
+        return @min(anim_width, term_size.width);
+    }
+
+    return @min(anim_width, 800);
+}
 
 // ---------------------------------------------------------------
 // Terminal Lottie Renderer
@@ -10,7 +57,7 @@ const Allocator = std.mem.Allocator;
 
 /// Configuration for terminal rendering.
 pub const RenderConfig = struct {
-    /// Output width in pixels (default: animation width, capped at 800).
+    /// Output width in pixels (default: animation width, capped at terminal width or 800).
     width: ?u32 = null,
     /// Output height in pixels (default: proportional to width).
     height: ?u32 = null,
@@ -31,7 +78,7 @@ pub fn render(
     writer: anytype,
 ) !void {
     // Determine output dimensions
-    const out_w = config.width orelse @min(anim.width, 800);
+    const out_w = defaultOutputWidth(anim.width, config.width);
     const out_h = config.height orelse blk: {
         const aspect = @as(f64, @floatFromInt(anim.height)) / @as(f64, @floatFromInt(anim.width));
         break :blk @as(u32, @intFromFloat(@as(f64, @floatFromInt(out_w)) * aspect));
@@ -212,4 +259,25 @@ test "renderSingleFrame: invisible layer produces no shapes" {
     // Everything should be black
     const center = buf.getPixel(50, 50).?;
     try testing.expectEqual(@as(u8, 0), center[0]);
+}
+
+test "defaultOutputWidth: explicit config takes priority" {
+    try testing.expectEqual(@as(u32, 400), defaultOutputWidth(1920, 400));
+}
+
+test "defaultOutputWidth: falls back to capped anim width without terminal" {
+    // When running in test, stdout is not a terminal — so getTerminalPixelSize
+    // should return null and we fall through to the 800px cap.
+    try testing.expectEqual(@as(u32, 800), defaultOutputWidth(1920, null));
+}
+
+test "defaultOutputWidth: small anim uses anim width as fallback" {
+    // Animation smaller than 800px should use its own width
+    try testing.expectEqual(@as(u32, 320), defaultOutputWidth(320, null));
+}
+
+test "getTerminalPixelSize: returns null for invalid fd" {
+    // fd -1 is invalid, ioctl should fail
+    const result = getTerminalPixelSize(-1);
+    try testing.expect(result == null);
 }
