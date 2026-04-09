@@ -31,80 +31,65 @@ const ST = "\x1b\\";
 const BASE64_CHUNK_SIZE = 4096;
 
 /// Encode RGBA pixel data to Kitty graphics protocol escape sequences.
-/// Writes directly to the provided writer.
+/// Streams base64 encoding in chunks without heap allocation.
 pub fn encodeImage(writer: anytype, buf: *const rasterizer.PixelBuffer) !void {
-    const encoded = try base64Encode(buf.data);
-    defer std.heap.page_allocator.free(encoded);
+    try encodeImageChunked(writer, buf, null);
+}
 
-    if (encoded.len <= BASE64_CHUNK_SIZE) {
-        // Single chunk
+/// Streaming chunked encoder shared by encodeImage and encodeImageReplace.
+/// Encodes raw RGBA data to base64 in fixed-size chunks, writing each chunk
+/// as a separate Kitty escape sequence. No heap allocation needed.
+fn encodeImageChunked(writer: anytype, buf: *const rasterizer.PixelBuffer, image_id: ?u32) !void {
+    const data = buf.data;
+    const total_b64_len = ((data.len + 2) / 3) * 4;
+
+    // Number of raw bytes that produce exactly BASE64_CHUNK_SIZE base64 chars
+    const raw_per_chunk: usize = (BASE64_CHUNK_SIZE / 4) * 3; // 3072
+
+    var raw_offset: usize = 0;
+    var b64_written: usize = 0;
+    var first = true;
+    var b64_buf: [BASE64_CHUNK_SIZE + 4]u8 = undefined; // small stack buffer for one chunk
+
+    while (b64_written < total_b64_len) {
+        const raw_end = @min(raw_offset + raw_per_chunk, data.len);
+        const chunk = data[raw_offset..raw_end];
+
+        const encoded = std.base64.standard.Encoder.encode(&b64_buf, chunk);
+        const is_last = raw_end == data.len;
+
         try writer.writeAll(ESC_G);
-        try writer.print("a=T,f=32,s={d},v={d},q=2,m=0;", .{ buf.width, buf.height });
-        try writer.writeAll(encoded);
-        try writer.writeAll(ST);
-    } else {
-        // Chunked transfer
-        var offset: usize = 0;
-        var first = true;
-        while (offset < encoded.len) {
-            const end = @min(offset + BASE64_CHUNK_SIZE, encoded.len);
-            const is_last = end == encoded.len;
-
-            try writer.writeAll(ESC_G);
-            if (first) {
+        if (first) {
+            if (image_id) |id| {
+                try writer.print("a=T,f=32,s={d},v={d},i={d},p=1,q=2,m={d};", .{
+                    buf.width,
+                    buf.height,
+                    id,
+                    @as(u8, if (is_last) 0 else 1),
+                });
+            } else {
                 try writer.print("a=T,f=32,s={d},v={d},q=2,m={d};", .{
                     buf.width,
                     buf.height,
                     @as(u8, if (is_last) 0 else 1),
                 });
-                first = false;
-            } else {
-                try writer.print("m={d};", .{@as(u8, if (is_last) 0 else 1)});
             }
-            try writer.writeAll(encoded[offset..end]);
-            try writer.writeAll(ST);
-
-            offset = end;
+            first = false;
+        } else {
+            try writer.print("m={d};", .{@as(u8, if (is_last) 0 else 1)});
         }
+        try writer.writeAll(encoded);
+        try writer.writeAll(ST);
+
+        raw_offset = raw_end;
+        b64_written += encoded.len;
     }
 }
 
 /// Encode a replacement image at the cursor position (for animation).
 /// Uses placement to allow clearing/replacing.
 pub fn encodeImageReplace(writer: anytype, buf: *const rasterizer.PixelBuffer, image_id: u32) !void {
-    const encoded = try base64Encode(buf.data);
-    defer std.heap.page_allocator.free(encoded);
-
-    if (encoded.len <= BASE64_CHUNK_SIZE) {
-        try writer.writeAll(ESC_G);
-        try writer.print("a=T,f=32,s={d},v={d},i={d},q=2,m=0;", .{ buf.width, buf.height, image_id });
-        try writer.writeAll(encoded);
-        try writer.writeAll(ST);
-    } else {
-        var offset: usize = 0;
-        var first = true;
-        while (offset < encoded.len) {
-            const end = @min(offset + BASE64_CHUNK_SIZE, encoded.len);
-            const is_last = end == encoded.len;
-
-            try writer.writeAll(ESC_G);
-            if (first) {
-                try writer.print("a=T,f=32,s={d},v={d},i={d},q=2,m={d};", .{
-                    buf.width,
-                    buf.height,
-                    image_id,
-                    @as(u8, if (is_last) 0 else 1),
-                });
-                first = false;
-            } else {
-                try writer.print("m={d};", .{@as(u8, if (is_last) 0 else 1)});
-            }
-            try writer.writeAll(encoded[offset..end]);
-            try writer.writeAll(ST);
-
-            offset = end;
-        }
-    }
+    try encodeImageChunked(writer, buf, image_id);
 }
 
 /// Delete an image by ID.
