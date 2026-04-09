@@ -113,7 +113,9 @@ pub fn render(
     const total_frames: usize = if (frame_end > frame_start) @intCast(frame_end - frame_start) else 0;
     if (total_frames == 0) return;
 
-    const frame_duration_ns: u64 = @intFromFloat(1_000_000_000.0 / anim.frame_rate);
+    const max_render_fps: f64 = 30.0;
+    const render_fps = @min(anim.frame_rate, max_render_fps);
+    const frame_duration_ns: u64 = @intFromFloat(1_000_000_000.0 / render_fps);
 
     var buf = try rasterizer.PixelBuffer.init(allocator, out_w, out_h, config.background);
     defer buf.deinit();
@@ -123,11 +125,32 @@ pub fn render(
     try kitty.hideCursor(writer);
     defer kitty.showCursor(writer) catch {};
 
+    const loop_duration_ns: u64 = frame_duration_ns * total_frames;
     var loops_done: u32 = 0;
+    var first_frame = true;
     while (config.loops == 0 or loops_done < config.loops) : (loops_done += 1) {
-        for (0..total_frames) |fi| {
+        var loop_timer = try std.time.Timer.start();
+
+        var last_fi: ?usize = null;
+        while (true) {
+            const elapsed_ns = loop_timer.read();
+            if (elapsed_ns >= loop_duration_ns) break;
+
+            // Determine which frame we should be showing based on wall-clock time
+            const fi: usize = @intCast(elapsed_ns / frame_duration_ns);
+            if (fi >= total_frames) break;
+
+            // Skip frames we've already passed
+            if (last_fi) |prev| {
+                if (fi == prev) {
+                    // Still on the same frame — sleep a short interval and re-check
+                    std.Thread.sleep(1_000_000); // 1ms
+                    continue;
+                }
+            }
+            last_fi = fi;
+
             const frame_time: f64 = @floatFromInt(frame_start + @as(i64, @intCast(fi)));
-            var timer = try std.time.Timer.start();
 
             buf.clear(config.background);
 
@@ -136,20 +159,15 @@ pub fn render(
 
             rasterizer.renderFrame(&buf, &frame, scale_mat);
 
-            // Move cursor back to overwrite the previous frame
-            if (fi > 0 or loops_done > 0) {
+            // Reposition cursor for next frame (same image ID auto-replaces)
+            if (!first_frame) {
                 try kitty.cursorHome(writer);
                 try kitty.cursorUp(writer, approx_rows);
             }
+            first_frame = false;
 
-            try kitty.encodeImage(writer, &buf);
+            try kitty.encodeImageReplace(writer, &buf, 1);
             try writer.writeAll("\n");
-
-            // Sleep for remaining frame time
-            const elapsed_ns = timer.read();
-            if (elapsed_ns < frame_duration_ns) {
-                std.Thread.sleep(frame_duration_ns - elapsed_ns);
-            }
         }
     }
 }
