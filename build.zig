@@ -194,8 +194,9 @@ fn versionOptions(b: *std.Build, ver: []const u8) *std.Build.Step.Options {
 
 fn readVersion(b: *std.Build) []const u8 {
     const path = b.pathFromRoot("VERSION");
+    const io = b.graph.io;
     // Build-time invariant: VERSION file must exist at project root.
-    const data = std.fs.cwd().readFileAlloc(b.allocator, path, 64) catch
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, b.allocator, .limited(64)) catch
         @panic("cannot read VERSION file");
-    return std.mem.trimRight(u8, data, &.{ '\n', '\r', ' ' });
+    return std.mem.trimEnd(u8, data, &.{ '\n', '\r', ' ' });
 }

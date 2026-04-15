@@ -36,6 +36,7 @@ pub const PixelBuffer = struct {
         };
     }
 
+    /// Free the pixel buffer memory.
     pub fn deinit(self: *PixelBuffer) void {
         self.allocator.free(self.data);
     }
@@ -99,6 +100,7 @@ pub const Matrix = struct {
     tx: f64 = 0,
     ty: f64 = 0,
 
+    /// The identity matrix (no transformation).
     pub const identity = Matrix{};
 
     /// Multiply this * other (this applied after other).
@@ -446,7 +448,6 @@ pub fn strokeRect(buf: *PixelBuffer, cx: f64, cy: f64, w: f64, h: f64, color: Pi
     // Draw 4 edges as thin filled rects
     const half_w = w / 2.0;
     const half_h = h / 2.0;
-    const hw = width / 2.0;
 
     // Top edge
     fillRect(buf, cx, cy - half_h, w + width, width, color, mat);
@@ -456,7 +457,6 @@ pub fn strokeRect(buf: *PixelBuffer, cx: f64, cy: f64, w: f64, h: f64, color: Pi
     fillRect(buf, cx - half_w, cy, width, h - width, color, mat);
     // Right edge
     fillRect(buf, cx + half_w, cy, width, h - width, color, mat);
-    _ = hw;
 }
 
 // ---------------------------------------------------------------

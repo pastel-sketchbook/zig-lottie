@@ -122,92 +122,21 @@ pub fn showCursor(writer: anytype) !void {
 }
 
 // ---------------------------------------------------------------
-// Base64 encoding
-// ---------------------------------------------------------------
-
-const base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Base64 encode a byte slice. Caller owns the returned slice.
-pub fn base64Encode(data: []const u8) ![]u8 {
-    const out_len = ((data.len + 2) / 3) * 4;
-    const out = try std.heap.page_allocator.alloc(u8, out_len);
-
-    var i: usize = 0;
-    var o: usize = 0;
-    while (i + 3 <= data.len) : ({
-        i += 3;
-        o += 4;
-    }) {
-        const b0: u32 = data[i];
-        const b1: u32 = data[i + 1];
-        const b2: u32 = data[i + 2];
-        const val = (b0 << 16) | (b1 << 8) | b2;
-        out[o] = base64_chars[(val >> 18) & 0x3f];
-        out[o + 1] = base64_chars[(val >> 12) & 0x3f];
-        out[o + 2] = base64_chars[(val >> 6) & 0x3f];
-        out[o + 3] = base64_chars[val & 0x3f];
-    }
-
-    const remaining = data.len - i;
-    if (remaining == 1) {
-        const b0: u32 = data[i];
-        const val = b0 << 16;
-        out[o] = base64_chars[(val >> 18) & 0x3f];
-        out[o + 1] = base64_chars[(val >> 12) & 0x3f];
-        out[o + 2] = '=';
-        out[o + 3] = '=';
-    } else if (remaining == 2) {
-        const b0: u32 = data[i];
-        const b1: u32 = data[i + 1];
-        const val = (b0 << 16) | (b1 << 8);
-        out[o] = base64_chars[(val >> 18) & 0x3f];
-        out[o + 1] = base64_chars[(val >> 12) & 0x3f];
-        out[o + 2] = base64_chars[(val >> 6) & 0x3f];
-        out[o + 3] = '=';
-    }
-
-    return out;
-}
-
-// ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
 
 const testing = std.testing;
-
-test "base64Encode: empty" {
-    const result = try base64Encode("");
-    defer std.heap.page_allocator.free(result);
-    try testing.expectEqual(@as(usize, 0), result.len);
-}
-
-test "base64Encode: standard test vectors" {
-    // RFC 4648 test vectors
-    const cases = [_]struct { input: []const u8, expected: []const u8 }{
-        .{ .input = "f", .expected = "Zg==" },
-        .{ .input = "fo", .expected = "Zm8=" },
-        .{ .input = "foo", .expected = "Zm9v" },
-        .{ .input = "foob", .expected = "Zm9vYg==" },
-        .{ .input = "fooba", .expected = "Zm9vYmE=" },
-        .{ .input = "foobar", .expected = "Zm9vYmFy" },
-    };
-    for (cases) |tc| {
-        const result = try base64Encode(tc.input);
-        defer std.heap.page_allocator.free(result);
-        try testing.expectEqualStrings(tc.expected, result);
-    }
-}
 
 test "encodeImage: small image produces valid escape sequence" {
     // Create a tiny 2x2 RGBA buffer
     var buf = try rasterizer.PixelBuffer.init(testing.allocator, 2, 2, .{ 255, 0, 0, 255 });
     defer buf.deinit();
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try encodeImage(output.writer(testing.allocator), &buf);
-    const result = output.items;
+    try encodeImage(&aw.writer, &buf);
+    const result = aw.writer.buffered();
 
     // Should start with ESC_G and end with ST
     try testing.expect(std.mem.startsWith(u8, result, ESC_G));
@@ -223,11 +152,11 @@ test "encodeImage: parameters include action and quiet" {
     var buf = try rasterizer.PixelBuffer.init(testing.allocator, 1, 1, .{ 0, 0, 0, 255 });
     defer buf.deinit();
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try encodeImage(output.writer(testing.allocator), &buf);
-    const result = output.items;
+    try encodeImage(&aw.writer, &buf);
+    const result = aw.writer.buffered();
 
     try testing.expect(std.mem.indexOf(u8, result, "a=T") != null);
     try testing.expect(std.mem.indexOf(u8, result, "q=2") != null);
@@ -237,21 +166,21 @@ test "encodeImageReplace: includes image ID" {
     var buf = try rasterizer.PixelBuffer.init(testing.allocator, 1, 1, .{ 0, 0, 0, 255 });
     defer buf.deinit();
 
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try encodeImageReplace(output.writer(testing.allocator), &buf, 42);
-    const result = output.items;
+    try encodeImageReplace(&aw.writer, &buf, 42);
+    const result = aw.writer.buffered();
 
     try testing.expect(std.mem.indexOf(u8, result, "i=42") != null);
 }
 
 test "deleteImage: produces valid delete sequence" {
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try deleteImage(output.writer(testing.allocator), 7);
-    const result = output.items;
+    try deleteImage(&aw.writer, 7);
+    const result = aw.writer.buffered();
 
     try testing.expect(std.mem.startsWith(u8, result, ESC_G));
     try testing.expect(std.mem.indexOf(u8, result, "a=d") != null);
@@ -259,22 +188,25 @@ test "deleteImage: produces valid delete sequence" {
 }
 
 test "cursorUp: emits ANSI escape" {
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try cursorUp(output.writer(testing.allocator), 5);
-    try testing.expectEqualStrings("\x1b[5A", output.items);
+    try cursorUp(&aw.writer, 5);
+    try testing.expectEqualStrings("\x1b[5A", aw.writer.buffered());
 }
 
 test "hideCursor and showCursor" {
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try hideCursor(output.writer(testing.allocator));
-    try testing.expectEqualStrings("\x1b[?25l", output.items);
+    try hideCursor(&aw.writer);
+    try testing.expectEqualStrings("\x1b[?25l", aw.writer.buffered());
+}
 
-    output.clearAndFree(testing.allocator);
+test "showCursor" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
-    try showCursor(output.writer(testing.allocator));
-    try testing.expectEqualStrings("\x1b[?25h", output.items);
+    try showCursor(&aw.writer);
+    try testing.expectEqualStrings("\x1b[?25h", aw.writer.buffered());
 }

@@ -41,7 +41,7 @@ tasks:
   clean:
     desc: Clean build artifacts
     cmds:
-      - rm -rf .zig-cache zig-out
+      - rm -rf .zig-cache zig-out zig-pkg
 
   render:
     desc: Render a Lottie animation in the terminal (Kitty graphics)

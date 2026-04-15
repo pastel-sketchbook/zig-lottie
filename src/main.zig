@@ -2,20 +2,21 @@ const std = @import("std");
 const lottie = @import("zig-lottie");
 const terminal = @import("terminal");
 
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
     defer stdout.flush() catch {};
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
     const stderr = &stderr_writer.interface;
     defer stderr.flush() catch {};
 
-    var args = std.process.args();
+    var args = init.minimal.args.iterate();
     _ = args.skip(); // skip executable name
 
     const subcommand = args.next() orelse {
@@ -31,21 +32,21 @@ pub fn main() !void {
             stderr.flush() catch {};
             std.process.exit(1);
         };
-        try inspectFile(allocator, path, stdout, stderr);
+        try inspectFile(allocator, io, path, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "validate")) {
         const path = args.next() orelse {
             try stderr.print("error: validate requires a file path\n", .{});
             stderr.flush() catch {};
             std.process.exit(1);
         };
-        try validateFile(allocator, path, stdout, stderr);
+        try validateFile(allocator, io, path, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "render")) {
         const path = args.next() orelse {
             try stderr.print("error: render requires a file path\n", .{});
             stderr.flush() catch {};
             std.process.exit(1);
         };
-        try renderFile(allocator, path, &args, stdout, stderr);
+        try renderFile(allocator, io, path, &args, stdout, stderr);
     } else if (std.mem.eql(u8, subcommand, "help")) {
         try printUsage(stdout);
     } else {
@@ -56,8 +57,8 @@ pub fn main() !void {
     }
 }
 
-fn inspectFile(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer) !void {
-    const anim = loadAndParse(allocator, path, stderr);
+fn inspectFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer) !void {
+    const anim = loadAndParse(allocator, io, path, stderr);
     defer anim.deinit();
 
     try writer.print("File:       {s}\n", .{path});
@@ -166,8 +167,8 @@ fn inspectFile(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.W
     }
 }
 
-fn validateFile(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer) !void {
-    const anim = loadAndParse(allocator, path, stderr);
+fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, writer: *std.Io.Writer, stderr: *std.Io.Writer) !void {
+    const anim = loadAndParse(allocator, io, path, stderr);
     defer anim.deinit();
 
     const issues = lottie.validate(allocator, &anim) catch |err| {
@@ -204,15 +205,17 @@ fn validateFile(allocator: std.mem.Allocator, path: []const u8, writer: *std.Io.
     }
 }
 
-fn loadAndParse(allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.Writer) lottie.Animation {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+fn loadAndParse(allocator: std.mem.Allocator, io: std.Io, path: []const u8, stderr: *std.Io.Writer) lottie.Animation {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         stderr.print("error: cannot open '{s}': {}\n", .{ path, err }) catch {};
         stderr.flush() catch {};
         std.process.exit(1);
     };
-    defer file.close();
+    defer file.close(io);
 
-    const contents = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch |err| {
+    var read_buf: [8192]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    const contents = reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024)) catch |err| {
         stderr.print("error: cannot read '{s}': {}\n", .{ path, err }) catch {};
         stderr.flush() catch {};
         std.process.exit(1);
@@ -228,8 +231,9 @@ fn loadAndParse(allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.
 
 fn renderFile(
     allocator: std.mem.Allocator,
+    io: std.Io,
     path: []const u8,
-    args: *std.process.ArgIterator,
+    args: anytype,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !void {
@@ -299,13 +303,13 @@ fn renderFile(
         }
     }
 
-    const anim = loadAndParse(allocator, path, stderr);
+    const anim = loadAndParse(allocator, io, path, stderr);
     defer anim.deinit();
 
     // Flush any prior buffered output before rendering.
     stdout.flush() catch {};
 
-    terminal.render(allocator, &anim, config, stdout) catch |err| {
+    terminal.render(allocator, &anim, config, io, stdout) catch |err| {
         try stderr.print("error: render failed: {}\n", .{err});
         stderr.flush() catch {};
         std.process.exit(1);
@@ -444,8 +448,8 @@ fn printUsage(writer: *std.Io.Writer) !void {
 }
 
 test "printUsage does not error" {
-    // Verify printUsage runs without crashing by writing to stderr.
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-    try printUsage(&stderr_writer.interface);
+    // Verify printUsage runs without crashing by writing to a stack buffer.
+    var buf: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try printUsage(&writer);
 }

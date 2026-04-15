@@ -645,6 +645,7 @@ fn parseAnimatedMulti(allocator: Allocator, val: std.json.Value) ParseError!Anim
             }
             break :blk allocator.alloc(f64, 0) catch return ParseError.OutOfMemory;
         } else allocator.alloc(f64, 0) catch return ParseError.OutOfMemory;
+        errdefer allocator.free(values);
 
         const ease_out = parseEaseHandle(kf_obj.get("o"));
         const ease_in = parseEaseHandle(kf_obj.get("i"));
@@ -923,9 +924,9 @@ fn lottieParseInner(ptr: [*]const u8, len: u32) !?[*]u8 {
 
     // Build a simple JSON result string using only integer formatting
     // to avoid pulling in the full float-to-decimal machinery (~5KB).
-    var result: std.ArrayList(u8) = .empty;
-    errdefer result.deinit(wasm_allocator);
-    const w = result.writer(wasm_allocator);
+    var aw: std.Io.Writer.Allocating = .init(wasm_allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
 
     try writeStr(w, "{\"ok\":true,\"version\":\"");
     try writeStr(w, anim.version_str);
@@ -970,7 +971,7 @@ fn lottieParseInner(ptr: [*]const u8, len: u32) !?[*]u8 {
     }
     try writeStr(w, "]}");
 
-    const slice = try result.toOwnedSlice(wasm_allocator);
+    const slice = try aw.toOwnedSlice();
     return slice.ptr;
 }
 
@@ -1001,9 +1002,9 @@ fn lottieValidateInner(ptr: [*]const u8, len: u32) !?[*]u8 {
         }
     }
 
-    var result: std.ArrayList(u8) = .empty;
-    errdefer result.deinit(wasm_allocator);
-    const w = result.writer(wasm_allocator);
+    var aw: std.Io.Writer.Allocating = .init(wasm_allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
 
     try writeStr(w, "{\"valid\":");
     try writeStr(w, if (errors == 0) "true" else "false");
@@ -1036,7 +1037,7 @@ fn lottieValidateInner(ptr: [*]const u8, len: u32) !?[*]u8 {
 
     try writeStr(w, "]}");
 
-    const out = try result.toOwnedSlice(wasm_allocator);
+    const out = try aw.toOwnedSlice();
     return out.ptr;
 }
 
@@ -1154,9 +1155,9 @@ fn lottieCompileFrameInner(ptr: [*]const u8, len: u32, frame_num: f64) !?[*]u8 {
     const frame = compileFrame(wasm_allocator, &anim, frame_num) catch return null;
     defer frame.deinit();
 
-    var result: std.ArrayList(u8) = .empty;
-    errdefer result.deinit(wasm_allocator);
-    const w = result.writer(wasm_allocator);
+    var aw: std.Io.Writer.Allocating = .init(wasm_allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
 
     try writeStr(w, "{\"frame\":");
     try writeF64(w, frame.frame);
@@ -1169,7 +1170,7 @@ fn lottieCompileFrameInner(ptr: [*]const u8, len: u32, frame_num: f64) !?[*]u8 {
 
     try writeStr(w, "]}");
 
-    const slice = try result.toOwnedSlice(wasm_allocator);
+    const slice = try aw.toOwnedSlice();
     return slice.ptr;
 }
 
@@ -1188,9 +1189,9 @@ fn lottieCompileInner(ptr: [*]const u8, len: u32) !?[*]u8 {
     const compiled = compile(wasm_allocator, &anim) catch return null;
     defer compiled.deinit();
 
-    var result: std.ArrayList(u8) = .empty;
-    errdefer result.deinit(wasm_allocator);
-    const w = result.writer(wasm_allocator);
+    var aw: std.Io.Writer.Allocating = .init(wasm_allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
 
     try writeStr(w, "{\"frame_rate\":");
     try writeF64(w, compiled.frame_rate);
@@ -1218,7 +1219,7 @@ fn lottieCompileInner(ptr: [*]const u8, len: u32) !?[*]u8 {
 
     try writeStr(w, "]}");
 
-    const slice = try result.toOwnedSlice(wasm_allocator);
+    const slice = try aw.toOwnedSlice();
     return slice.ptr;
 }
 
@@ -1867,15 +1868,16 @@ pub fn compile(allocator: Allocator, anim: *const Animation) !CompiledAnimation 
     const frame_count: usize = if (end > start) @intCast(end - start) else 0;
 
     var frames = try allocator.alloc(CompiledFrame, frame_count);
+    var compiled_count: usize = 0;
     errdefer {
-        // Free any frames we've already compiled
-        for (frames) |*f| {
-            if (f.layers.len > 0) f.deinit();
+        // Free only the frames we've successfully compiled
+        for (frames[0..compiled_count]) |*f| {
+            f.deinit();
         }
         allocator.free(frames);
     }
 
-    // Initialize all frames to empty so errdefer works
+    // Initialize all frames to empty so the slice is valid
     for (frames) |*f| {
         f.* = CompiledFrame{
             .allocator = allocator,
@@ -1887,6 +1889,7 @@ pub fn compile(allocator: Allocator, anim: *const Animation) !CompiledAnimation 
     for (0..frame_count) |i| {
         const frame_time: f64 = @floatFromInt(start + @as(i64, @intCast(i)));
         frames[i] = try compileFrame(allocator, anim, frame_time);
+        compiled_count += 1;
     }
 
     return CompiledAnimation{
@@ -2416,9 +2419,12 @@ test "parse rejects shape missing ty" {
 // ---------------------------------------------------------------
 
 fn readFixture(path: []const u8) ![]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(testing.allocator, 4 * 1024 * 1024);
+    const io = testing.io;
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var read_buf: [8192]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    return try reader.interface.allocRemaining(testing.allocator, .limited(4 * 1024 * 1024));
 }
 
 test "fixture: many_layers.json (148KB, 50 layers)" {

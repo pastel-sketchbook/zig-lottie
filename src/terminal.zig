@@ -75,6 +75,7 @@ pub fn render(
     allocator: Allocator,
     anim: *const lottie.Animation,
     config: RenderConfig,
+    io: std.Io,
     writer: anytype,
 ) !void {
     // Determine output dimensions
@@ -129,11 +130,12 @@ pub fn render(
     var loops_done: u32 = 0;
     var first_frame = true;
     while (config.loops == 0 or loops_done < config.loops) : (loops_done += 1) {
-        var loop_timer = try std.time.Timer.start();
+        const loop_start = std.Io.Clock.Timestamp.now(io, .awake);
 
         var last_fi: ?usize = null;
         while (true) {
-            const elapsed_ns = loop_timer.read();
+            const elapsed = loop_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake));
+            const elapsed_ns: u64 = @intCast(@max(0, elapsed.raw.nanoseconds));
             if (elapsed_ns >= loop_duration_ns) break;
 
             // Determine which frame we should be showing based on wall-clock time
@@ -144,7 +146,11 @@ pub fn render(
             if (last_fi) |prev| {
                 if (fi == prev) {
                     // Still on the same frame — sleep a short interval and re-check
-                    std.Thread.sleep(1_000_000); // 1ms
+                    const sleep_dur: std.Io.Clock.Duration = .{
+                        .raw = .fromMilliseconds(1),
+                        .clock = .awake,
+                    };
+                    sleep_dur.sleep(io) catch {};
                     continue;
                 }
             }
